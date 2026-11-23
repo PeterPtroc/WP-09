@@ -33,6 +33,8 @@ jobs:
           packages: 'platforms;android-35 build-tools;35.0.0 ndk;27.1.12297006 cmake;3.22.1'
       - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
       - name: Build and lint
+        env:
+          WP09_MAVEN_CENTRAL_URL: https://maven-central.storage-download.googleapis.com/maven2/
         run: ./gradlew --no-daemon :app:lintDebug :app:assembleDebug :app:assembleDebugAndroidTest :app:assembleRelease
       - name: Upload debug APK
         if: ${{ github.ref_type != 'tag' }}

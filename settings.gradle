@@ -1,7 +1,9 @@
 pluginManagement {
     repositories {
         google()
-        mavenCentral()
+        mavenCentral {
+            url = uri(providers.environmentVariable('WP09_MAVEN_CENTRAL_URL').getOrElse(url.toString()))
+        }
         gradlePluginPortal()
     }
 }
@@ -9,7 +11,9 @@ dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
-        mavenCentral()
+        mavenCentral {
+            url = uri(providers.environmentVariable('WP09_MAVEN_CENTRAL_URL').getOrElse(url.toString()))
+        }
     }
 }
 rootProject.name = 'Wp09Thermal'

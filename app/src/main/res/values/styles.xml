@@ -1,0 +1,19 @@
+<resources>
+    <style name="Theme.Wp09" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">#DEDEDE</item>
+        <item name="colorOnPrimary">#151515</item>
+        <item name="colorSurface">#151515</item>
+        <item name="colorOnSurface">#EEEEEE</item>
+        <item name="colorSecondaryContainer">#333333</item>
+        <item name="colorOnSecondaryContainer">#EEEEEE</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="shapeAppearanceCornerExtraSmall">@style/ShapeAppearance.Wp09.Square</item>
+        <item name="shapeAppearanceCornerSmall">@style/ShapeAppearance.Wp09.Square</item>
+        <item name="shapeAppearanceCornerMedium">@style/ShapeAppearance.Wp09.Square</item>
+        <item name="shapeAppearanceCornerLarge">@style/ShapeAppearance.Wp09.Square</item>
+        <item name="shapeAppearanceCornerExtraLarge">@style/ShapeAppearance.Wp09.Square</item>
+    </style>
+    <style name="ShapeAppearance.Wp09.Square" parent="ShapeAppearance.Material3.Corner.None">
+        <item name="cornerSize">0dp</item>
+    </style>
+</resources>

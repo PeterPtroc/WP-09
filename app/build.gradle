@@ -1,0 +1,42 @@
+plugins {
+    id 'com.android.application' version '8.9.2'
+}
+
+android {
+    namespace 'org.thermal.wp09'
+    compileSdk 35
+    ndkVersion '27.1.12297006'
+
+    defaultConfig {
+        applicationId 'org.thermal.wp09'
+        minSdk 24
+        targetSdk 35
+        versionCode 7
+        versionName '0.7'
+        testInstrumentationRunner 'org.thermal.wp09.ThermalSmokeTest'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // The original SDK uses older ELF segment layouts on some devices.
+            useLegacyPackaging = true
+        }
+    }
+}
+
+dependencies {
+    implementation 'com.google.android.material:material:1.12.0'
+}

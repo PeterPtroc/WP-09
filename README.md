@@ -1,5 +1,7 @@
 # WP-09 热成像
 
+> 本分支归档了 WP-09 热像与手机摄像头画面的实验性融合功能，现已停止维护。可按下方“构建与验证”步骤编译此版本。
+
 面向登陆舰 WP-09 USB-C 直连的 Android 应用。安装包使用独立包名，可与原应用共存。支持 Android 7.0 及以上的 ARM64 手机，连接设备需要 USB Host（OTG）。
 
 在 [GitHub Releases](https://github.com/PeterPtroc/WP-09/releases/latest) 下载 `WP-09-v*-arm64.apk` 安装。手机无需安装英睿应用。如果手机上装过本项目的调试版，先备份要保留的数据，再卸载调试版并安装正式版。后续使用本项目正式签名的版本可以覆盖升级。
@@ -15,6 +17,23 @@
 只有收到可验证的辐射测温数据时，界面才会显示摄氏值。如果状态显示“图像已连接 · 无温度数据”，画面仍支持切换色彩和拍录。现场校准依赖可用的温度流。官方 WP-09 规格列出了 USB-C、256×192 和激光指示，未给出绝对测温精度。[英睿 WP-09 产品规格](https://inreii.com/wp09/)
 
 已用一帧 `XWild_WP09_C`（固件 `V0.1.2`）的实机 USB 数据回放验证三点解码。亮度受场景对比度和饱和影响，改变取景范围可能改变估算读数。全图平均温度需要逐像素测温数据。
+
+## 热融合
+
+1. 接入 WP-09，点“热融合” → “自动对齐” → **“AI 对齐当前画面”**。保持手机稳定，让两路都能看到同一距离上的转角、接头或其他有辨识度的结构。手机在本地运行 MINIMA-LoFTR 的粗匹配网络，一次估计可见光到热像的缩放、旋转和平移。匹配点过少或集中在一条边上时，应用提示重试。
+2. 提示“AI 对齐已保存”后即可移动取景。同一设备、镜头和安装方式下，下次打开时会复用结果。移动热像仪、切换镜头或明显改变目标距离后，再点一次 AI 对齐。近处物体和远处背景存在视差，一次标定通常只能让一个距离上的轮廓重合。
+3. 也可以选择“用手掌自动对齐”。固定手机，对准有光照的空墙，点“开始”，将伸开的手掌沿墙面依次停在三个圆圈里。此模式根据两路共同边缘微调，跟踪失败时显示纯热像。
+4. “手动设置”可调热像占比、相机缩放（20%–1200%）、水平和垂直偏移（各 ±400%）。点数值可直接输入，点“角度”可按 1° 旋转。点“完成对齐”保存。拍照和录像使用当前配准，选点温度来自热像。
+
+点“存图对”会在 Android 10 及以上的 `Download/WP09` 中保存 ZIP（旧系统在应用专属下载目录）。其中有未经叠加的热像灰度 PNG、后置相机 PNG，以及两路在手机端的接收时差和手动参数。可用完整的 MINIMA-LoFTR 在电脑上复核并生成预览。[MINIMA 论文](https://openaccess.thecvf.com/content/CVPR2025/html/Ren_MINIMA_Modality_Invariant_Image_Matching_CVPR_2025_paper.html) · [作者权重](https://github.com/LSXI7/storage/releases/download/MINIMA/minima_loftr.ckpt)
+
+```sh
+# Python 3.11，在虚拟环境中运行
+python -m pip install torch==2.7.1 kornia==0.8.1 opencv-python-headless==4.11.0.86 'numpy<2.3'
+python tools/align_fusion_pair.py 图对.zip --weights minima_loftr.ckpt --preview 对齐.png
+```
+
+APK 已包含手机模型。要从作者权重重新生成，另安装 `onnx==1.17.0`，运行 `python tools/export_mobile_matcher.py minima_loftr.ckpt app/src/main/assets/minima-loftr-coarse.onnx`。
 
 ## 实机取样
 

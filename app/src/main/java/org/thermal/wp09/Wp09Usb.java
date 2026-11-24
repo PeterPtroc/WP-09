@@ -7,7 +7,7 @@ final class Wp09Usb {
 
     static native int open(int fd, int vendor, int product, int address, String usbfs,
                            long[] outputHandle);
-    static native int read(long handle, byte[] frame);
+    static native int read(long handle, byte[] frame, long[] receivedAt);
     static native byte[] sample(long handle);
     static native int laser(long handle, boolean enabled);
     static native void close(long handle);

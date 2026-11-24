@@ -11,8 +11,14 @@ import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.os.SystemClock;
 import android.view.MotionEvent;
 import android.view.View;
+
+import java.io.IOException;
+import java.util.Properties;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
@@ -40,12 +46,27 @@ final class ThermalView extends View {
     private final RectF labelBox = new RectF();
     private final Matrix frameToView = new Matrix();
     private final Matrix viewToFrame = new Matrix();
+    private final Matrix visibleToView = new Matrix();
+    private final float[] visibleMatrix = new float[9];
     private final float[] mappedPoint = new float[2];
     private final Bitmap bitmap = Bitmap.createBitmap(ThermalFrame.WIDTH, ThermalFrame.HEIGHT,
             Bitmap.Config.ARGB_8888);
     private final int[] rendered = new int[ThermalFrame.PIXELS];
     private final float density;
     private ThermalFrame frame;
+    private Bitmap visible;
+    private long visibleAt;
+    private long thermalTime, visibleTime;
+    private boolean automaticFusion;
+    private FusionRegistration.Transform automaticTransform;
+    private long transformUntil;
+    private int alignmentGuide = -1;
+    private int sensorOrientation;
+    private int fusionRotation;
+    private int visibleAlpha;
+    private float fusionZoom;
+    private float fusionX;
+    private float fusionY;
     private Calibration calibration = Calibration.DEFAULT;
     private boolean measuring = true;
     private int palette;
@@ -72,6 +93,126 @@ final class ThermalView extends View {
         calibration = correction;
         measuring = temperatureOn;
         if (bitmapChanged) updateBitmap();
+        invalidate();
+    }
+
+    void showVisible(int[] argb, int width, int height, int orientation) {
+        showVisible(argb, width, height, orientation, SystemClock.elapsedRealtimeNanos());
+    }
+
+    void showVisible(int[] argb, int width, int height, int orientation, long receivedAt) {
+        if (visible == null || visible.getWidth() != width || visible.getHeight() != height) {
+            visible = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        }
+        visible.setPixels(argb, 0, width, 0, 0, width, height);
+        sensorOrientation = orientation;
+        visibleAt = SystemClock.elapsedRealtime();
+        visibleTime = receivedAt;
+        invalidate();
+    }
+
+    void clearVisible() {
+        visible = null;
+        visibleTime = 0;
+        invalidate();
+    }
+
+    static final class Pair {
+        final ThermalFrame heat;
+        final Bitmap camera;
+        final int angle, rotation;
+        final float zoom, x, y;
+
+        Pair(ThermalFrame heat, Bitmap camera, int angle, int rotation, float zoom, float x, float y) {
+            this.heat = heat;
+            this.camera = camera;
+            this.angle = angle;
+            this.rotation = rotation;
+            this.zoom = zoom;
+            this.x = x;
+            this.y = y;
+        }
+
+        int[] thermalPixels() {
+            if (!heat.hasPixelTemperatures()) return heat.preview;
+            int[] pixels = new int[ThermalFrame.PIXELS];
+            float range = heat.maximum - heat.minimum;
+            for (int i = 0; i < pixels.length; i++) {
+                int shade = range > 0 ? Math.round(255 * (heat.readings[i] - heat.minimum) / range) : 127;
+                int gray = Math.max(0, Math.min(255, shade));
+                pixels[i] = Color.rgb(gray, gray, gray);
+            }
+            return pixels;
+        }
+    }
+
+    Pair currentPair() {
+        long now = SystemClock.elapsedRealtimeNanos();
+        if (frame == null || visible == null || !FusionRegistration.paired(thermalTime, visibleTime)
+                || now - Math.min(thermalTime, visibleTime) > 500_000_000L) return null;
+        return new Pair(frame, visible.copy(Bitmap.Config.ARGB_8888, false), sensorOrientation,
+                fusionRotation, fusionZoom, fusionX, fusionY);
+    }
+
+    ThermalMedia.Writer captureFusionPair() {
+        Pair pair = currentPair();
+        if (pair == null) return null;
+        Properties info = new Properties();
+        info.setProperty("sensor_orientation", Integer.toString(pair.angle));
+        info.setProperty("arrival_delta_ms", Long.toString((visibleTime - thermalTime) / 1_000_000L));
+        info.setProperty("thermal_mode", pair.heat.hasPixelTemperatures() ? "radiometric_preview" : "grayscale_preview");
+        info.setProperty("manual_zoom", Integer.toString(Math.round(pair.zoom * 100)));
+        info.setProperty("manual_x", Integer.toString(Math.round(pair.x * 100)));
+        info.setProperty("manual_y", Integer.toString(Math.round(pair.y * 100)));
+        info.setProperty("manual_rotation", Integer.toString(pair.rotation));
+        return stream -> {
+            try (ZipOutputStream zip = new ZipOutputStream(stream)) {
+                Bitmap gray = Bitmap.createBitmap(pair.thermalPixels(), ThermalFrame.WIDTH, ThermalFrame.HEIGHT,
+                        Bitmap.Config.ARGB_8888);
+                try {
+                    writeImage(zip, "thermal.png", gray);
+                    writeImage(zip, "visible.png", pair.camera);
+                    zip.putNextEntry(new ZipEntry("pair.properties"));
+                    info.store(zip, "WP-09 fusion pair");
+                    zip.closeEntry();
+                } finally {
+                    gray.recycle();
+                }
+            } finally {
+                pair.camera.recycle();
+            }
+        };
+    }
+
+    private static void writeImage(ZipOutputStream zip, String name, Bitmap image) throws IOException {
+        zip.putNextEntry(new ZipEntry(name));
+        if (!image.compress(Bitmap.CompressFormat.PNG, 100, zip)) throw new IOException("PNG encoding failed");
+        zip.closeEntry();
+    }
+
+    void setThermalTime(long receivedAt) {
+        thermalTime = receivedAt;
+    }
+
+    void setAutomaticFusion(boolean automatic, FusionRegistration.Transform transform, long until) {
+        automaticFusion = automatic;
+        automaticTransform = transform;
+        transformUntil = until;
+        invalidate();
+    }
+
+    void setAlignmentGuide(int guide) {
+        if (alignmentGuide == guide) return;
+        alignmentGuide = guide;
+        invalidate();
+    }
+
+    void setFusion(int opacity, int zoom, int x, int y, int rotation) {
+        visibleAlpha = Math.round(255 * (100 - opacity) / 100f);
+        fusionZoom = zoom / 100f;
+        fusionX = x / 100f;
+        fusionY = y / 100f;
+        fusionRotation = rotation;
         invalidate();
     }
 
@@ -186,13 +327,22 @@ final class ThermalView extends View {
         paint.setShader(null);
         paint.setColor(0xff080808);
         canvas.drawRect(image, paint);
-        if (frame != null) canvas.drawBitmap(bitmap, frameToView, paint);
+        if (frame != null) {
+            canvas.drawBitmap(bitmap, frameToView, paint);
+            if (visible != null && visibleAlpha > 0 && SystemClock.elapsedRealtime() - visibleAt <= 500
+                    && (!automaticFusion || automaticTransform != null &&
+                    SystemClock.elapsedRealtimeNanos() <= transformUntil &&
+                    FusionRegistration.paired(thermalTime, visibleTime))) {
+                drawVisible(canvas);
+            }
+        }
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(d(1));
         paint.setColor(0xff3b3b3b);
         canvas.drawRect(image, paint);
         paint.setStyle(Paint.Style.FILL);
 
+        if (live && alignmentGuide >= 0) drawAlignmentGuide(canvas);
         if (!measuring) return;
         boolean valid = frame != null && frame.hasTemperature();
         drawScale(canvas, valid && frame.hasPixelTemperatures(), overlay);
@@ -203,6 +353,60 @@ final class ThermalView extends View {
                     "高 " + number(calibration.apply(frame.maximum)) + "°", 1);
             mark(canvas, spot, Color.WHITE, d(9), true, null, 0);
         }
+    }
+
+    private void drawVisible(Canvas canvas) {
+        if (automaticFusion) {
+            float unit = image.width() / FusionRegistration.WIDTH;
+            float sx = unit * FusionRegistration.WIDTH / visible.getWidth();
+            float sy = unit * Math.round(FusionRegistration.WIDTH * visible.getHeight()
+                    / (float) visible.getWidth()) / visible.getHeight();
+            FusionRegistration.Transform transform = automaticTransform;
+            visibleMatrix[0] = transform.a * sx;
+            visibleMatrix[1] = -transform.b * sy;
+            visibleMatrix[2] = image.left + transform.x * unit;
+            visibleMatrix[3] = transform.b * sx;
+            visibleMatrix[4] = transform.a * sy;
+            visibleMatrix[5] = image.top + transform.y * unit;
+            visibleMatrix[8] = 1;
+            visibleToView.setValues(visibleMatrix);
+        } else {
+            mapCamera(visibleToView, visible.getWidth(), visible.getHeight(), image, sensorOrientation + fusionRotation,
+                    fusionZoom, fusionX, fusionY);
+        }
+        canvas.save();
+        canvas.clipRect(image);
+        paint.setAlpha(visibleAlpha);
+        canvas.drawBitmap(visible, visibleToView, paint);
+        paint.setAlpha(255);
+        canvas.restore();
+    }
+
+    static void mapCamera(Matrix matrix, int width, int height, RectF image, int angle,
+                          float zoom, float x, float y) {
+        double radians = Math.toRadians(angle);
+        float cos = (float) Math.abs(Math.cos(radians));
+        float sin = (float) Math.abs(Math.sin(radians));
+        float scale = zoom * Math.max((image.width() * cos + image.height() * sin) / width,
+                (image.width() * sin + image.height() * cos) / height);
+        matrix.setTranslate(-width / 2f, -height / 2f);
+        matrix.postRotate(angle);
+        matrix.postScale(scale, scale);
+        matrix.postTranslate(image.centerX() + x * image.width(), image.centerY() + y * image.height());
+    }
+
+    private void drawAlignmentGuide(Canvas canvas) {
+        float x = image.left + image.width() * FusionRegistration.TARGET_X[alignmentGuide];
+        float y = image.top + image.height() * FusionRegistration.TARGET_Y[alignmentGuide];
+        float radius = Math.min(d(22), image.width() * 0.085f);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(d(4));
+        paint.setColor(Color.BLACK);
+        glyph(canvas, x, y, radius, false);
+        paint.setStrokeWidth(d(2));
+        paint.setColor(Color.WHITE);
+        glyph(canvas, x, y, radius, false);
+        paint.setStyle(Paint.Style.FILL);
     }
 
     private void drawScale(Canvas canvas, boolean valid, boolean overlay) {

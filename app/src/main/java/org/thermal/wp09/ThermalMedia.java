@@ -71,6 +71,23 @@ final class ThermalMedia {
         });
     }
 
+    void savePair(ThermalView view) {
+        Writer pair = view.captureFusionPair();
+        if (pair == null) {
+            message("等待两路新画面，请稍后重试");
+            return;
+        }
+        worker.post(() -> {
+            try {
+                Uri collection = Build.VERSION.SDK_INT >= 29 ? MediaStore.Downloads.EXTERNAL_CONTENT_URI : null;
+                writeFile("WP09_pair_", ".zip", Environment.DIRECTORY_DOWNLOADS, "application/zip", collection, pair);
+                message(Build.VERSION.SDK_INT >= 29 ? "图对已存入 Download/WP09" : "图对已存入应用的 Download 目录");
+            } catch (IOException | RuntimeException error) {
+                message("图对保存失败");
+            }
+        });
+    }
+
     void start(Consumer<Boolean> ready) {
         worker.post(() -> {
             try {
@@ -179,9 +196,15 @@ final class ThermalMedia {
     }
 
     private void writeMedia(boolean movie, Writer writer) throws IOException {
-        String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ROOT).format(new Date());
-        String name = "WP09_" + stamp + (movie ? ".mp4" : ".png");
         String directory = movie ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES;
+        writeFile("WP09_", movie ? ".mp4" : ".png", directory, movie ? "video/mp4" : "image/png",
+                movie ? MediaStore.Video.Media.EXTERNAL_CONTENT_URI : MediaStore.Images.Media.EXTERNAL_CONTENT_URI, writer);
+    }
+
+    private void writeFile(String prefix, String extension, String directory, String mime, Uri collection,
+                           Writer writer) throws IOException {
+        String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ROOT).format(new Date());
+        String name = prefix + stamp + extension;
         if (Build.VERSION.SDK_INT < 29) {
             File folder = context.getExternalFilesDir(directory);
             if (folder == null) throw new IOException("External storage unavailable");
@@ -199,11 +222,10 @@ final class ThermalMedia {
         ContentResolver resolver = context.getContentResolver();
         ContentValues values = new ContentValues();
         values.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
-        values.put(MediaStore.MediaColumns.MIME_TYPE, movie ? "video/mp4" : "image/png");
+        values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
         values.put(MediaStore.MediaColumns.RELATIVE_PATH, directory + "/WP09");
         values.put(MediaStore.MediaColumns.IS_PENDING, 1);
-        Uri uri = resolver.insert(movie ? MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                : MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+        Uri uri = resolver.insert(collection, values);
         if (uri == null) throw new IOException("MediaStore insert failed");
         boolean committed = false;
         try {
@@ -220,7 +242,7 @@ final class ThermalMedia {
         }
     }
 
-    private interface Writer {
+    interface Writer {
         void write(OutputStream stream) throws IOException;
     }
 }

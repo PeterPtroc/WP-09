@@ -26,7 +26,11 @@ final class CameraController {
         worker = new Handler(thread.getLooper());
     }
 
-    void start(UsbDevice device, Consumer<ThermalFrame> onFrame, Consumer<String> onError) {
+    interface FrameListener {
+        void onFrame(ThermalFrame frame, long receivedAt);
+    }
+
+    void start(UsbDevice device, FrameListener onFrame, Consumer<String> onError) {
         stop();
         Session session = new Session(device, onFrame, onError);
         current = session;
@@ -77,9 +81,10 @@ final class CameraController {
 
     private final class Session {
         private final UsbDevice device;
-        private final Consumer<ThermalFrame> onFrame;
+        private final FrameListener onFrame;
         private final Consumer<String> onError;
         private final byte[] bytes = new byte[ThermalFrame.BYTES];
+        private final long[] receivedAt = new long[1];
         private final ThermalFrame.Decoder decoder = new ThermalFrame.Decoder();
         private UsbDeviceConnection connection;
         private long handle;
@@ -87,7 +92,7 @@ final class CameraController {
         private boolean delivering;
         private int unexpectedFrameBytes;
 
-        Session(UsbDevice device, Consumer<ThermalFrame> onFrame, Consumer<String> onError) {
+        Session(UsbDevice device, FrameListener onFrame, Consumer<String> onError) {
             this.device = device;
             this.onFrame = onFrame;
             this.onError = onError;
@@ -123,7 +128,7 @@ final class CameraController {
 
         void poll() {
             if (current != this) return;
-            int count = Wp09Usb.read(handle, bytes);
+            int count = Wp09Usb.read(handle, bytes, receivedAt);
             long now = SystemClock.elapsedRealtime();
             if (count < 0) unexpectedFrameBytes = -count;
             if (count == bytes.length) {
@@ -131,10 +136,11 @@ final class CameraController {
                 synchronized (this) {
                     if (!delivering) {
                         ThermalFrame frame = decoder.decode(bytes, emissivity);
+                        long arrival = receivedAt[0];
                         delivering = true;
                         main.post(() -> {
                             try {
-                                if (current == this) onFrame.accept(frame);
+                                if (current == this) onFrame.onFrame(frame, arrival);
                             } finally {
                                 synchronized (this) { delivering = false; }
                             }

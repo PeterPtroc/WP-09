@@ -18,6 +18,8 @@ import android.hardware.usb.UsbManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.text.InputType;
 import android.view.Gravity;
@@ -29,6 +31,7 @@ import android.widget.ArrayAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -46,11 +49,19 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.DoubleConsumer;
 
 public final class MainActivity extends AppCompatActivity {
     private static final String USB_PERMISSION = "org.thermal.wp09.USB_PERMISSION";
     private static final int CAMERA_PERMISSION = 1;
+    private static final int FUSION_OPACITY = 55;
+    private static final int FUSION_ZOOM = 100;
+    private static final int MIN_ZOOM = 20;
+    private static final int MAX_ZOOM = 1200;
+    private static final int MAX_OFFSET = 400;
+    private static final long ALIGNMENT_HOLD_NANOS = 550_000_000L;
     private static final int BG = 0xff151515;
     private static final int PANEL = 0xff222222;
     private static final int TEXT = 0xffeeeeee;
@@ -59,6 +70,7 @@ public final class MainActivity extends AppCompatActivity {
     private UsbManager usb;
     private SharedPreferences settings;
     private CameraController camera;
+    private VisibleCamera visibleCamera;
     private ThermalMedia media;
     private UsbDevice selected;
     private boolean started;
@@ -69,6 +81,25 @@ public final class MainActivity extends AppCompatActivity {
     private boolean laserBusy;
     private boolean recording;
     private boolean recordingStarting;
+    private boolean fusionEnabled;
+    private boolean fusionReady;
+    private boolean manualFusion;
+    private int fusionRotation;
+    private final ExecutorService registrationWorker = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable alignmentTimeout = () -> finishAutomaticCalibration(null, "标定超时。请固定手机，照亮背景后重试");
+    private FusionRegistration.Calibration fusionCalibration;
+    private FusionRegistration.Transform savedAlignment, pendingAlignment, trackedAlignment;
+    private FusionRegistration.Image visibleSample;
+    private String alignmentKey, visibleCameraId;
+    private int cameraWidth, cameraHeight, cameraOrientation;
+    private volatile int registrationGeneration;
+    private boolean learnedProfile, learning, waitingForPair;
+    private final Runnable pairTimeout = () -> {
+        if (waitingForPair) endLearnedAlignment(null, "暂未收到同步图对，请保持手机稳定后重试");
+    };
+    private boolean registrationBusy;
+    private long visibleSampleAt, lastRegistrationAt, lastUsedVisibleAt, trackingUntil;
     private int recordingRequest;
     private int palette;
     private float emissivity;
@@ -78,15 +109,24 @@ public final class MainActivity extends AppCompatActivity {
     private final ActivityResultLauncher<String> sampleDestination =
             registerForActivityResult(new ActivityResultContracts.CreateDocument("application/zip"),
                     this::saveUsbSample);
+    private final ActivityResultLauncher<String> fusionPermission = registerForActivityResult(
+            new ActivityResultContracts.RequestPermission(), granted -> {
+                if (granted && started && streaming) startFusion();
+                else if (!granted) message("请授予相机权限后开启热融合");
+            });
     private Calibration calibration;
     private float lowCalibrationReading = Float.NaN;
     private float lowCalibrationReference;
     private ThermalView thermal;
     private LinearLayout root, header, metrics, body, toolsPanel;
+    private LinearLayout capture, settingsRow, fusionRow, alignment;
+    private SeekBar fusionOpacity, fusionZoom, fusionX, fusionY;
     private FrameLayout preview;
     private TextView status, empty, hot, cold, average, spot;
+    private TextView fusionNotice;
     private MaterialButton laserButton, measurementButton, calibrationButton, paletteButton;
     private MaterialButton emissivityButton, photoButton, videoButton;
+    private MaterialButton fusionButton, alignmentButton, angleButton, pairButton;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -126,6 +166,8 @@ public final class MainActivity extends AppCompatActivity {
         emissivity = settings.getFloat("emissivity", 0.98f);
         camera = new CameraController(usb);
         camera.setEmissivity(emissivity);
+        visibleCamera = new VisibleCamera(this);
+        manualFusion = settings.getBoolean("fusion_manual", settings.contains("fusion_zoom"));
         media = new ThermalMedia(this, this::message);
         buildUi();
     }
@@ -194,7 +236,7 @@ public final class MainActivity extends AppCompatActivity {
         toolsPanel.setGravity(Gravity.CENTER_VERTICAL);
         body.addView(toolsPanel);
 
-        LinearLayout capture = horizontal();
+        capture = horizontal();
         capture.setGravity(Gravity.CENTER);
         capture.setPadding(dp(5), 0, dp(5), 0);
         toolsPanel.addView(capture);
@@ -206,12 +248,13 @@ public final class MainActivity extends AppCompatActivity {
             render();
         });
 
-        LinearLayout settingsRow = horizontal();
+        settingsRow = horizontal();
         settingsRow.setPadding(dp(5), 0, dp(5), dp(2));
         toolsPanel.addView(settingsRow);
         paletteButton = control(settingsRow, "", R.drawable.ic_palette, this::choosePalette);
         emissivityButton = control(settingsRow, "", R.drawable.ic_sliders_horizontal, this::chooseEmissivity);
         calibrationButton = control(settingsRow, "校准", R.drawable.ic_crosshair, this::chooseCalibration);
+        buildFusionControls();
         updateLayout(getResources().getConfiguration());
         render();
     }
@@ -278,6 +321,11 @@ public final class MainActivity extends AppCompatActivity {
 
     @Override protected void onDestroy() {
         camera.destroy();
+        visibleCamera.destroy();
+        registrationGeneration++;
+        mainHandler.removeCallbacks(alignmentTimeout);
+        mainHandler.removeCallbacks(pairTimeout);
+        registrationWorker.shutdown();
         media.destroy();
         super.onDestroy();
     }
@@ -332,10 +380,12 @@ public final class MainActivity extends AppCompatActivity {
         status.setText("正在连接");
         empty.setText("正在读取 WP-09");
         pluggedAt = SystemClock.elapsedRealtime();
-        camera.start(selected, next -> {
+        camera.start(selected, (next, receivedAt) -> {
             streaming = true;
             frame = next;
+            thermal.setThermalTime(receivedAt);
             render();
+            registerFrames(next, receivedAt);
             if (recording) media.frame(thermal, () -> {
                 recording = false;
                 recordingStarting = false;
@@ -350,6 +400,7 @@ public final class MainActivity extends AppCompatActivity {
 
     private void disconnect() {
         camera.stop();
+        stopFusion();
         stopVideo();
         selected = null;
         frame = null;
@@ -359,6 +410,401 @@ public final class MainActivity extends AppCompatActivity {
         laserBusy = false;
         lowCalibrationReading = Float.NaN;
         render();
+    }
+
+    private void buildFusionControls() {
+        alignment = new LinearLayout(this);
+        alignment.setOrientation(LinearLayout.VERTICAL);
+        alignment.setPadding(dp(5), 0, dp(5), 0);
+        alignment.setVisibility(View.GONE);
+        toolsPanel.addView(alignment);
+
+        LinearLayout first = horizontal();
+        alignment.addView(first);
+        fusionOpacity = fusionSlider(first, "热像占比", "fusion_opacity", 0, 100, FUSION_OPACITY);
+        fusionZoom = fusionSlider(first, "相机缩放", "fusion_zoom", MIN_ZOOM, MAX_ZOOM, FUSION_ZOOM);
+        LinearLayout second = horizontal();
+        alignment.addView(second);
+        fusionX = fusionSlider(second, "水平偏移", "fusion_x", -MAX_OFFSET, MAX_OFFSET, 0);
+        fusionY = fusionSlider(second, "垂直偏移", "fusion_y", -MAX_OFFSET, MAX_OFFSET, 0);
+
+        fusionRotation = settings.getInt("fusion_rotation", 0);
+        LinearLayout actions = horizontal();
+        alignment.addView(actions);
+        angleButton = control(actions, "", 0, () ->
+                editNumber("旋转角度", "输入角度，负数为逆时针", fusionRotation, number -> {
+                    fusionRotation = Math.floorMod((int) Math.round(number % 360), 360);
+                    applyFusionAlignment();
+                }));
+        control(actions, "旋转 90°", 0, () -> {
+            fusionRotation = (fusionRotation + 90) % 360;
+            applyFusionAlignment();
+        });
+        control(actions, "重置", 0, () -> {
+            fusionOpacity.setProgress(FUSION_OPACITY);
+            fusionZoom.setProgress(FUSION_ZOOM - MIN_ZOOM);
+            fusionX.setProgress(MAX_OFFSET);
+            fusionY.setProgress(MAX_OFFSET);
+            fusionRotation = 0;
+            applyFusionAlignment();
+        });
+        applyFusionAlignment();
+
+        fusionNotice = text("", 12, MUTED);
+        fusionNotice.setGravity(Gravity.CENTER);
+        fusionNotice.setPadding(dp(9), dp(4), dp(9), dp(4));
+        fusionNotice.setMinHeight(dp(28));
+        fusionNotice.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        toolsPanel.addView(fusionNotice);
+
+        fusionRow = horizontal();
+        fusionRow.setPadding(dp(5), 0, dp(5), dp(2));
+        toolsPanel.addView(fusionRow);
+        fusionButton = control(fusionRow, "热融合", R.drawable.ic_camera, this::toggleFusion);
+        alignmentButton = control(fusionRow, "自动对齐", R.drawable.ic_crosshair, this::chooseFusionAlignment);
+        pairButton = control(fusionRow, "存图对", 0, () -> media.savePair(thermal));
+    }
+
+    private SeekBar fusionSlider(LinearLayout row, String name, String key, int min, int max, int initial) {
+        LinearLayout column = new LinearLayout(this);
+        column.setOrientation(LinearLayout.VERTICAL);
+        column.setPadding(dp(4), 0, dp(4), 0);
+        row.addView(column, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView label = text(name, 11, TEXT);
+        label.setGravity(Gravity.CENTER);
+        column.addView(label);
+
+        SeekBar slider = new SeekBar(this);
+        slider.setContentDescription(name);
+        slider.setMax(max - min);
+        slider.setProgress(settings.getInt(key, initial) - min);
+        label.setText(name + " " + (slider.getProgress() + min) + "%");
+        label.setOnClickListener(ignored -> editNumber(name, min + "% 至 " + max + "%",
+                slider.getProgress() + min, number -> {
+                    if (number < min || number > max) throw new IllegalArgumentException("数值超出范围");
+                    slider.setProgress((int) Math.round(number) - min);
+                    applyFusionAlignment();
+                }));
+        column.addView(slider, new LinearLayout.LayoutParams(-1, dp(44)));
+        slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                label.setText(name + " " + (progress + min) + "%");
+                if (fromUser) applyFusionAlignment();
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar) {}
+            @Override public void onStopTrackingTouch(SeekBar bar) {}
+        });
+        return slider;
+    }
+
+    private void applyFusionAlignment() {
+        thermal.setFusion(fusionOpacity.getProgress(), fusionZoom.getProgress() + MIN_ZOOM,
+                fusionX.getProgress() - MAX_OFFSET, fusionY.getProgress() - MAX_OFFSET, fusionRotation);
+        setText(angleButton, "角度 " + fusionRotation + "°");
+    }
+
+    private void showFusionAlignment(boolean show) {
+        if (!show && alignment.getVisibility() == View.VISIBLE) {
+            settings.edit().putInt("fusion_opacity", fusionOpacity.getProgress())
+                    .putInt("fusion_zoom", fusionZoom.getProgress() + MIN_ZOOM)
+                    .putInt("fusion_x", fusionX.getProgress() - MAX_OFFSET)
+                    .putInt("fusion_y", fusionY.getProgress() - MAX_OFFSET)
+                    .putInt("fusion_rotation", fusionRotation).apply();
+        }
+        capture.setVisibility(show ? View.GONE : View.VISIBLE);
+        settingsRow.setVisibility(show ? View.GONE : View.VISIBLE);
+        alignment.setVisibility(show ? View.VISIBLE : View.GONE);
+        updateFusionButtons();
+    }
+
+    private void toggleFusion() {
+        if (fusionEnabled) {
+            stopFusion();
+        } else if (streaming && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            startFusion();
+        } else if (streaming) {
+            fusionPermission.launch(Manifest.permission.CAMERA);
+        }
+    }
+
+    private void startFusion() {
+        fusionEnabled = true;
+        thermal.setAutomaticFusion(!manualFusion, null, 0);
+        visibleCamera.start(this::receiveVisible, reason -> {
+            stopFusion();
+            message(reason);
+        });
+        updateFusionButtons();
+    }
+
+    private void stopFusion() {
+        if (!fusionEnabled) return;
+        fusionEnabled = false;
+        fusionReady = false;
+        invalidateRegistration();
+        fusionCalibration = null;
+        savedAlignment = null;
+        visibleSample = null;
+        visibleSampleAt = 0;
+        visibleCameraId = null;
+        alignmentKey = null;
+        visibleCamera.stop();
+        thermal.clearVisible();
+        showFusionAlignment(false);
+    }
+
+    private void updateFusionButtons() {
+        boolean aligning = alignment.getVisibility() == View.VISIBLE;
+        fusionRow.setVisibility(streaming ? View.VISIBLE : View.GONE);
+        button(fusionButton, fusionEnabled && !fusionReady ? "开启中" : "热融合", streaming, fusionEnabled);
+        String alignmentLabel = aligning ? "完成对齐" : learning ? "取消匹配" : fusionCalibration != null ? "取消标定" : "自动对齐";
+        button(alignmentButton, alignmentLabel, fusionReady, aligning || learning || fusionCalibration != null);
+        pairButton.setVisibility(fusionReady ? View.VISIBLE : View.GONE);
+        if (learning) {
+            fusionNotice.setVisibility(View.VISIBLE);
+            setText(fusionNotice, waitingForPair ? "正在采集两路画面" : "正在用模型匹配两路画面…");
+            return;
+        }
+        if (fusionCalibration != null) return;
+        boolean showNotice = fusionReady && !manualFusion;
+        fusionNotice.setVisibility(showNotice ? View.VISIBLE : View.GONE);
+        if (showNotice) {
+            String notice = "已自动对齐";
+            if (savedAlignment == null) notice = "首次使用请点自动对齐";
+            else if (learnedProfile) notice = "已应用 AI 标定";
+            else if (trackedAlignment == null) notice = "已标定 · 暂用纯热像";
+            setText(fusionNotice, notice);
+        }
+    }
+
+    private void chooseFusionAlignment() {
+        if (alignment.getVisibility() == View.VISIBLE) {
+            showFusionAlignment(false);
+        } else if (learning) {
+            endLearnedAlignment(null, "已取消匹配");
+        } else if (fusionCalibration != null) {
+            finishAutomaticCalibration(null, null);
+        } else {
+            dialog().setTitle("自动对齐")
+                    .setItems(new String[]{"AI 对齐当前画面", "用手掌自动对齐", "手动设置"}, (dialog, which) -> {
+                        if (!fusionReady) return;
+                        if (which == 0) {
+                            invalidateRegistration();
+                            learning = waitingForPair = true;
+                            updateFusionButtons();
+                            mainHandler.postDelayed(pairTimeout, 2500);
+                            startLearnedAlignmentIfPaired();
+                        } else if (which == 1) {
+                            dialog().setTitle("用手掌自动对齐")
+                                    .setMessage("把手机靠稳，对准空墙。圆圈出现后，将伸开的手掌沿墙面依次移到三个圆圈，各停一下。")
+                                    .setPositiveButton("开始", (d, button) -> beginAutomaticCalibration())
+                                    .setNegativeButton("取消", null).show();
+                        } else {
+                            if (!manualFusion && savedAlignment != null) copyAlignmentToSliders(savedAlignment);
+                            manualFusion = true;
+                            settings.edit().putBoolean("fusion_manual", true).apply();
+                            invalidateRegistration();
+                            thermal.setAutomaticFusion(false, null, 0);
+                            showFusionAlignment(true);
+                        }
+                    }).setNegativeButton("取消", null).show();
+        }
+    }
+
+    private void copyAlignmentToSliders(FusionRegistration.Transform transform) {
+        int w = FusionRegistration.WIDTH;
+        int h = FusionRegistration.HEIGHT;
+        int sourceHeight = Math.round(w * cameraHeight / (float) cameraWidth);
+        int angle = (int) Math.round(Math.toDegrees(Math.atan2(transform.b, transform.a)));
+        fusionRotation = Math.floorMod(angle - cameraOrientation, 360);
+        double radians = Math.toRadians(angle);
+        double cos = Math.abs(Math.cos(radians)), sin = Math.abs(Math.sin(radians));
+        double fill = Math.max((w * cos + h * sin) / w, (w * sin + h * cos) / sourceHeight);
+        int zoom = (int) Math.round(100 * Math.hypot(transform.a, transform.b) / fill);
+        float centerX = (transform.a * w - transform.b * sourceHeight) / 2 + transform.x;
+        float centerY = (transform.b * w + transform.a * sourceHeight) / 2 + transform.y;
+        fusionZoom.setProgress(zoom - MIN_ZOOM);
+        fusionX.setProgress(MAX_OFFSET + Math.round(100 * (centerX / w - .5f)));
+        fusionY.setProgress(MAX_OFFSET + Math.round(100 * (centerY / h - .5f)));
+        applyFusionAlignment();
+    }
+
+    private void startLearnedAlignmentIfPaired() {
+        if (!waitingForPair) return;
+        ThermalView.Pair pair = thermal.currentPair();
+        if (pair == null) return;
+        waitingForPair = false;
+        mainHandler.removeCallbacks(pairTimeout);
+        updateFusionButtons();
+        int generation = registrationGeneration;
+        registrationWorker.execute(() -> {
+            FusionRegistration.Transform result = null;
+            String notice = "共同轮廓不足，请把管接头、转角等清晰结构纳入两路画面后重试";
+            try {
+                result = LearnedAlignment.estimate(getApplicationContext(), pair, () -> generation != registrationGeneration);
+                if (result != null) notice = "AI 对齐已保存";
+            } catch (Exception | LinkageError e) {
+                android.util.Log.e("WP09", "Learned alignment failed", e);
+                notice = "模型运行失败，可用手掌对齐或保存图对";
+            } finally {
+                pair.camera.recycle();
+            }
+            FusionRegistration.Transform match = result;
+            String statusText = notice;
+            mainHandler.post(() -> {
+                if (generation == registrationGeneration) endLearnedAlignment(match, statusText);
+            });
+        });
+    }
+
+    private void endLearnedAlignment(FusionRegistration.Transform result, String notice) {
+        invalidateRegistration();
+        if (result != null) {
+            savedAlignment = result;
+            learnedProfile = true;
+            manualFusion = false;
+            settings.edit().putString(alignmentKey, result.encode()).putBoolean(alignmentKey + ".ai", true)
+                    .putBoolean("fusion_manual", false).apply();
+        }
+        restoreAlignment();
+        updateFusionButtons();
+        message(notice);
+    }
+
+    private void restoreAlignment() {
+        thermal.setAutomaticFusion(!manualFusion, learnedProfile ? savedAlignment : null, learnedProfile ? Long.MAX_VALUE : 0);
+    }
+
+    private void beginAutomaticCalibration() {
+        if (!fusionReady) return;
+        invalidateRegistration();
+        fusionCalibration = new FusionRegistration.Calibration();
+        thermal.setAutomaticFusion(true, null, 0);
+        fusionNotice.setVisibility(View.VISIBLE);
+        setText(fusionNotice, "保持手机不动，先空出画面");
+        mainHandler.postDelayed(alignmentTimeout, 45_000);
+        updateFusionButtons();
+    }
+
+    private void finishAutomaticCalibration(FusionRegistration.Transform result, String notice) {
+        if (fusionCalibration == null) return;
+        fusionCalibration = null;
+        invalidateRegistration();
+        if (result != null) {
+            savedAlignment = result;
+            learnedProfile = false;
+            manualFusion = false;
+            settings.edit().putString(alignmentKey, result.encode()).remove(alignmentKey + ".ai")
+                    .putBoolean("fusion_manual", false).apply();
+        }
+        restoreAlignment();
+        updateFusionButtons();
+        if (notice != null) message(notice);
+    }
+
+    private void invalidateRegistration() {
+        registrationGeneration++;
+        learning = waitingForPair = false;
+        mainHandler.removeCallbacks(pairTimeout);
+        mainHandler.removeCallbacks(alignmentTimeout);
+        lastRegistrationAt = lastUsedVisibleAt = trackingUntil = 0;
+        pendingAlignment = trackedAlignment = null;
+        thermal.setAlignmentGuide(-1);
+    }
+
+    private void receiveVisible(int[] pixels, int width, int height, int orientation, String id, long receivedAt) {
+        if (!id.equals(visibleCameraId) || width != cameraWidth || height != cameraHeight
+                || orientation != cameraOrientation) {
+            if (fusionCalibration != null) finishAutomaticCalibration(null, "相机画面尺寸已变化，请重新标定");
+            invalidateRegistration();
+            visibleCameraId = id;
+            cameraWidth = width;
+            cameraHeight = height;
+            cameraOrientation = orientation;
+            alignmentKey = "fusion_auto." + usbAlignmentId() + "." + id + "." + width + "x" + height
+                    + "." + orientation;
+            savedAlignment = FusionRegistration.Transform.decode(settings.getString(alignmentKey, null));
+            learnedProfile = savedAlignment != null && settings.getBoolean(alignmentKey + ".ai", false);
+            visibleSampleAt = 0;
+            restoreAlignment();
+        }
+        thermal.showVisible(pixels, width, height, orientation, receivedAt);
+        startLearnedAlignmentIfPaired();
+        boolean checking = fusionCalibration != null || !manualFusion && !learnedProfile && savedAlignment != null;
+        if (checking && receivedAt - visibleSampleAt >= 48_000_000L) {
+            visibleSample = FusionRegistration.Image.fromVisible(pixels, width, height);
+            visibleSampleAt = receivedAt;
+        }
+        if (!fusionReady) {
+            fusionReady = true;
+            updateFusionButtons();
+        }
+    }
+
+    private String usbAlignmentId() {
+        if (selected == null) return "unknown";
+        String model = selected.getVendorId() + "." + selected.getProductId();
+        try {
+            String serial = selected.getSerialNumber();
+            return serial == null ? model : model + "." + serial;
+        } catch (SecurityException denied) {
+            return model;
+        }
+    }
+
+    private void registerFrames(ThermalFrame next, long receivedAt) {
+        startLearnedAlignmentIfPaired();
+        if (learning || learnedProfile && fusionCalibration == null) return;
+        FusionRegistration.Calibration setup = fusionCalibration;
+        FusionRegistration.Transform base = savedAlignment;
+        if (!fusionReady || setup == null && (manualFusion || base == null) || registrationBusy) return;
+        if (setup == null && trackedAlignment != null && SystemClock.elapsedRealtimeNanos() > trackingUntil) {
+            updateTracking(null);
+        }
+        long interval = setup == null ? 210_000_000L : 125_000_000L;
+        if (receivedAt - lastRegistrationAt < interval || visibleSampleAt == lastUsedVisibleAt
+                || !FusionRegistration.paired(receivedAt, visibleSampleAt)) return;
+
+        FusionRegistration.Image light = visibleSample;
+        int generation = registrationGeneration;
+        lastRegistrationAt = receivedAt;
+        lastUsedVisibleAt = visibleSampleAt;
+        registrationBusy = true;
+        registrationWorker.execute(() -> {
+            FusionRegistration.Image heat = FusionRegistration.Image.fromThermal(next);
+            int step = setup == null ? -1 : setup.observe(heat, light);
+            FusionRegistration.Transform result = setup == null ? FusionRegistration.track(heat, light, base)
+                    : step == FusionRegistration.TARGET_X.length ? setup.result() : null;
+            mainHandler.post(() -> {
+                registrationBusy = false;
+                if (generation != registrationGeneration) return;
+                if (setup == null) {
+                    updateTracking(SystemClock.elapsedRealtimeNanos() - receivedAt <= ALIGNMENT_HOLD_NANOS
+                            ? result : null);
+                } else if (step == FusionRegistration.TARGET_X.length) {
+                    finishAutomaticCalibration(result, result == null ? "三个位置没能对齐，请在同一距离重试"
+                            : "自动对齐已保存");
+                } else if (step >= 0) {
+                    thermal.setAlignmentGuide(step);
+                    setText(fusionNotice, (step + 1) + "/3 把手掌移到圆圈，停一下");
+                }
+            });
+        });
+    }
+
+    private void updateTracking(FusionRegistration.Transform result) {
+        if (result != null && pendingAlignment != null && Math.abs(result.x - pendingAlignment.x) <= 2
+                && Math.abs(result.y - pendingAlignment.y) <= 2) {
+            trackedAlignment = result;
+            trackingUntil = SystemClock.elapsedRealtimeNanos() + ALIGNMENT_HOLD_NANOS;
+        } else if (result == null || trackedAlignment == null || Math.abs(result.x - trackedAlignment.x) > 2
+                || Math.abs(result.y - trackedAlignment.y) > 2) {
+            trackedAlignment = null;
+            trackingUntil = 0;
+        }
+        pendingAlignment = result;
+        thermal.setAutomaticFusion(true, trackedAlignment, trackingUntil);
+        updateFusionButtons();
     }
 
     private void showUsbDiagnostics() {
@@ -588,6 +1034,7 @@ public final class MainActivity extends AppCompatActivity {
         button(emissivityButton, "ε " + emissivity, true, false);
         button(calibrationButton, Float.isFinite(lowCalibrationReading) ? "校准高点" : "校准",
                 shown, calibration.applied);
+        updateFusionButtons();
     }
 
     private void showValue(TextView view, float celsius) {
@@ -641,7 +1088,7 @@ public final class MainActivity extends AppCompatActivity {
         button.setInsetBottom(0);
         button.setCornerRadius(0);
         button.setStrokeWidth(0);
-        button.setIconResource(icon);
+        if (icon != 0) button.setIconResource(icon);
         button.setIconSize(dp(16));
         button.setIconPadding(dp(4));
         button.setIconGravity(MaterialButton.ICON_GRAVITY_TEXT_START);

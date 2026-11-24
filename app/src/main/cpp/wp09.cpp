@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <dlfcn.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <array>
@@ -70,6 +71,7 @@ struct Camera {
     std::mutex mutex;
     std::array<jbyte, sampleCapacity> bytes;
     size_t length = 0;
+    jlong receivedAt = 0;
     bool unread = false;
 
     ~Camera() {
@@ -83,10 +85,13 @@ struct Camera {
 };
 
 void onFrame(unsigned char* data, void* opaque, size_t length) {
+    timespec now{};
+    clock_gettime(CLOCK_BOOTTIME, &now);
     auto& camera = *static_cast<Camera*>(opaque);
     std::lock_guard<std::mutex> lock(camera.mutex);
     if (length <= camera.bytes.size()) std::memcpy(camera.bytes.data(), data, length);
     camera.length = length;
+    camera.receivedAt = static_cast<jlong>(now.tv_sec) * 1000000000LL + now.tv_nsec;
     camera.unread = true;
 }
 
@@ -155,13 +160,15 @@ Java_org_thermal_wp09_Wp09Usb_open(JNIEnv* env, jclass, jint fd, jint vendor, ji
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_org_thermal_wp09_Wp09Usb_read(JNIEnv* env, jclass, jlong pointer, jbyteArray output) {
+Java_org_thermal_wp09_Wp09Usb_read(JNIEnv* env, jclass, jlong pointer, jbyteArray output,
+                                  jlongArray receivedAt) {
     auto& camera = *reinterpret_cast<Camera*>(pointer);
     std::lock_guard<std::mutex> lock(camera.mutex);
     if (!camera.unread) return 0;
     camera.unread = false;
     if (camera.length != frameBytes) return -static_cast<int>(camera.length);
     env->SetByteArrayRegion(output, 0, frameBytes, camera.bytes.data());
+    env->SetLongArrayRegion(receivedAt, 0, 1, &camera.receivedAt);
     return frameBytes;
 }
 

@@ -111,8 +111,9 @@ final class ThermalView extends View {
     String spotDisplay() {
         float value = calibration.apply(spotReading());
         if (!Float.isFinite(value)) return "—";
-        return frame.isEstimatedAt(spot) ? "约 " + Math.round(value) + " °C"
-                : number(value) + " °C";
+        String displayValue = frame.isInterpolatedAt(spot) ? Integer.toString(Math.round(value))
+                : number(value);
+        return displayValue + " °C";
     }
 
     float calibrationReading() {

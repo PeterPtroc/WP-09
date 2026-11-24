@@ -49,6 +49,29 @@ final class CameraController {
         });
     }
 
+    static boolean supportsFullFrame(UsbDevice device) {
+        if (device == null || device.getVendorId() != 0x3474 || device.getProductId() != 0x6015) {
+            return false;
+        }
+        return "XWild_WP09_C".equals(device.getProductName());
+    }
+
+    void captureFullFrame(Consumer<ThermalFrame> callback) {
+        Session session = current;
+        worker.post(() -> {
+            if (session == null || current != session || session.handle == 0
+                    || !supportsFullFrame(session.device)) return;
+            byte[] reference = new byte[ThermalFrame.BYTES];
+            byte[] dump = Wp09Usb.captureRawDump(session.handle, reference);
+            ThermalFrame frame = dump == null ? null
+                    : session.decoder.decodeSnapshot(dump, 7, reference, emissivity);
+            session.lastReceived = SystemClock.elapsedRealtime();
+            main.post(() -> {
+                if (current == session) callback.accept(frame);
+            });
+        });
+    }
+
     void setLaser(boolean enabled, Consumer<Boolean> callback) {
         Session session = current;
         if (session == null) {

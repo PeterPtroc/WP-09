@@ -2,11 +2,16 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include "thermal_dump.h"
+
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <thread>
+#include <utility>
 
 namespace {
 constexpr int width = 256;
@@ -16,6 +21,8 @@ constexpr int sampleCapacity = 512 * 1024;
 constexpr int tableSize = 16384;
 constexpr int laserOff = 0x8085;
 constexpr int laserOn = 0x8086;
+constexpr uint16_t captureRawFrames = 0x802f;
+constexpr int hidInterface = 4;
 
 // The bundled XWild libuvc callback receives (bytes, user, length).
 struct UvcContext;
@@ -71,6 +78,8 @@ struct Camera {
     std::array<jbyte, sampleCapacity> bytes;
     size_t length = 0;
     bool unread = false;
+    std::vector<uint8_t> previousDump;
+    bool knownDump = false;
 
     ~Camera() {
         if (laserMayBeOn) api.zoom(handle, laserOff);
@@ -80,6 +89,33 @@ struct Camera {
         if (context) api.exit(context);
         if (fd >= 0) ::close(fd);
     }
+};
+
+class HidInterface {
+public:
+    HidInterface(void* uvc, UvcHandle* camera) {
+        UsbHandle* (*getHandle)(UvcHandle*) = nullptr;
+        int (*claim)(UsbHandle*, int) = nullptr;
+        if (library && bind(library, "libusb_claim_interface", claim)
+                && bind(library, "libusb_release_interface", release)
+                && bind(library, "libusb_interrupt_transfer", transfer)
+                && bind(uvc, "uvc_get_libusb_handle", getHandle)) {
+            auto* device = getHandle(camera);
+            if (device && claim(device, hidInterface) == 0) handle = device;
+        }
+    }
+
+    ~HidInterface() {
+        if (handle) release(handle, hidInterface);
+        if (library) dlclose(library);
+    }
+
+    UsbHandle* handle = nullptr;
+    InterruptTransfer transfer = nullptr;
+
+private:
+    void* library = dlopen("libusb100.so", RTLD_NOW | RTLD_LOCAL);
+    int (*release)(UsbHandle*, int) = nullptr;
 };
 
 void onFrame(unsigned char* data, void* opaque, size_t length) {
@@ -174,6 +210,43 @@ Java_org_thermal_wp09_Wp09Usb_sample(JNIEnv* env, jclass, jlong pointer) {
     auto bytes = env->NewByteArray(length);
     if (bytes) env->SetByteArrayRegion(bytes, 0, length, camera.bytes.data());
     return bytes;
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_org_thermal_wp09_Wp09Usb_captureRawDump(JNIEnv* env, jclass, jlong pointer,
+                                             jbyteArray reference) {
+    auto& camera = *reinterpret_cast<Camera*>(pointer);
+    HidInterface hid(camera.api.lib, camera.handle);
+    if (!hid.handle) return nullptr;
+    if (!camera.knownDump) {
+        auto baseline = readThermalDump(hid.handle, hid.transfer, camera.previousDump);
+        if (baseline == DumpResult::failed) return nullptr;
+        camera.knownDump = true;
+    }
+
+    if (camera.api.zoom(camera.handle, captureRawFrames) != 0) return nullptr;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    {
+        std::lock_guard<std::mutex> lock(camera.mutex);
+        if (camera.length != frameBytes) return nullptr;
+        env->SetByteArrayRegion(reference, 0, frameBytes, camera.bytes.data());
+    }
+    if (env->ExceptionCheck()) return nullptr;
+
+    std::vector<uint8_t> dump;
+    auto status = readThermalDump(hid.handle, hid.transfer, dump);
+    if (status != DumpResult::received || dump == camera.previousDump) {
+        if (status == DumpResult::failed) camera.knownDump = false;
+        return nullptr;
+    }
+    camera.previousDump = std::move(dump);
+    const auto length = static_cast<jsize>(camera.previousDump.size());
+    auto output = env->NewByteArray(length);
+    if (output) {
+        env->SetByteArrayRegion(output, 0, length,
+                reinterpret_cast<const jbyte*>(camera.previousDump.data()));
+    }
+    return output;
 }
 
 extern "C" JNIEXPORT jint JNICALL

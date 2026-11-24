@@ -41,7 +41,7 @@ final class ThermalFrame {
         return readings != null;
     }
 
-    boolean isEstimatedAt(int pixel) {
+    boolean isInterpolatedAt(int pixel) {
         return readings == null && pixel != CENTER && pixel != cold && pixel != hot;
     }
 
@@ -73,6 +73,10 @@ final class ThermalFrame {
     }
 
     static final class Decoder {
+        private static final int DUMP_ROW_BYTES = 768;
+        private static final int DUMP_FRAME_BYTES = 203 * DUMP_ROW_BYTES;
+        private static final int DUMP_FRAMES = 8;
+        private static final int DUMP_IMAGE_OFFSET = 8 * DUMP_ROW_BYTES;
         private final float[] table = new float[16384];
         private final int[] calibrationWords = new int[14];
         private boolean tableReady;
@@ -88,7 +92,7 @@ final class ThermalFrame {
                 boolean fullFrame = matchesPixel(frame, hot, maximum)
                         && matchesPixel(frame, cold, minimum);
                 if (fullFrame && updateTable(bytes, frame, emissivity)) {
-                    ThermalFrame temperature = convert(frame);
+                    ThermalFrame temperature = convert(frame, 0, WIDTH * Short.BYTES, false);
                     if (temperature != null) return temperature;
                 } else if (isMonochromeYuyv(bytes) && updateTable(bytes, frame, emissivity)) {
                     // XWild's preview mode retains three radiometric counts in the trailer.
@@ -105,6 +109,19 @@ final class ThermalFrame {
             }
             return new ThermalFrame(null, preview(bytes), -1, -1,
                     Float.NaN, Float.NaN, Float.NaN, Float.NaN);
+        }
+
+        ThermalFrame decodeSnapshot(byte[] dump, int index, byte[] reference, float emissivity) {
+            if (dump.length != DUMP_FRAMES * DUMP_FRAME_BYTES || index < 0 || index >= DUMP_FRAMES
+                    || reference.length != BYTES) return null;
+            ByteBuffer metadata = ByteBuffer.wrap(reference).order(ByteOrder.LITTLE_ENDIAN);
+            if (!hasTelemetry(metadata) || !updateTable(reference, metadata, emissivity)) return null;
+
+            // The firmware dump includes eight reference rows before the active area and
+            // padding after each row. Map each active sensor count through the vendor table.
+            ByteBuffer sensor = ByteBuffer.wrap(dump).order(ByteOrder.LITTLE_ENDIAN);
+            return convert(sensor, index * DUMP_FRAME_BYTES + DUMP_IMAGE_OFFSET,
+                    DUMP_ROW_BYTES, true);
         }
 
         private boolean hasTelemetry(ByteBuffer frame) {
@@ -157,14 +174,14 @@ final class ThermalFrame {
             return tableReady;
         }
 
-        private ThermalFrame convert(ByteBuffer frame) {
+        private ThermalFrame convert(ByteBuffer frame, int offset, int rowBytes, boolean requireAllPixels) {
             float[] temperatures = new float[PIXELS];
             int cold = -1;
             int hot = -1;
             double sum = 0;
             int valid = 0;
             for (int i = 0; i < PIXELS; i++) {
-                int raw = word(frame, 2 * i);
+                int raw = word(frame, offset + i / WIDTH * rowBytes + (i % WIDTH) * Short.BYTES);
                 float value = raw > 0 && raw < table.length ? table[raw] : Float.NaN;
                 if (!validTemperature(value)) {
                     temperatures[i] = Float.NaN;
@@ -176,7 +193,7 @@ final class ThermalFrame {
                 sum += value;
                 valid++;
             }
-            if (valid < PIXELS * 0.98) return null;
+            if (valid < PIXELS * 0.98 || (requireAllPixels && valid != PIXELS)) return null;
             return new ThermalFrame(temperatures, null, cold, hot, temperatures[cold],
                     temperatures[hot], temperatures[CENTER], (float) (sum / valid));
         }

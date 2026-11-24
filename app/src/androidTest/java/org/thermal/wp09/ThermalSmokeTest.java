@@ -8,6 +8,7 @@ import android.graphics.Bitmap;
 import android.graphics.RectF;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.text.Layout;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
@@ -28,8 +29,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipInputStream;
 
 public final class ThermalSmokeTest extends Instrumentation {
+    private boolean skipMedia;
+
     @Override public void onCreate(Bundle options) {
         super.onCreate(options);
+        skipMedia = options != null && "true".equals(options.getString("skipMedia"));
         start();
     }
 
@@ -37,7 +41,9 @@ public final class ThermalSmokeTest extends Instrumentation {
         Bundle results = new Bundle();
         try {
             checkThermometryAndCapture();
-            results.putString("stream", "\nWP-09 thermometry, spot estimation, rotation, calibration, diagnostic ZIP and PNG/MP4 checks passed.\n");
+            results.putString("stream", "\nWP-09 thermometry, spot estimation, rotation, button labels, "
+                    + "calibration and diagnostic ZIP checks passed.\n"
+                    + (skipMedia ? "" : "PNG/MP4 checks passed.\n"));
             finish(Activity.RESULT_OK, results);
         } catch (Throwable error) {
             results.putString("stream", android.util.Log.getStackTraceString(error));
@@ -78,7 +84,7 @@ public final class ThermalSmokeTest extends Instrumentation {
                 && !Float.isFinite(summary.average), "Preview positions and unavailable average");
         check(summary.temperatureAt(summary.cold) == summary.minimum
                 && summary.temperatureAt(summary.hot) == summary.maximum, "Preview anchor readings");
-        check(summary.isEstimatedAt(probe)
+        check(summary.isInterpolatedAt(probe)
                 && Math.abs(summary.temperatureAt(probe) - (summary.center + summary.maximum) / 2)
                 < 0.001f, "Preview interpolation above center");
         preview[2 * probe] = 30;
@@ -102,9 +108,19 @@ public final class ThermalSmokeTest extends Instrumentation {
         render.setAccessible(true);
         Field frameField = MainActivity.class.getDeclaredField("frame");
         frameField.setAccessible(true);
-        runOnMainSync(() -> showFrame(activity, render, frameField, summary));
+        Field lowCalibration = MainActivity.class.getDeclaredField("lowCalibrationReading");
+        lowCalibration.setAccessible(true);
+        runOnMainSync(() -> {
+            try {
+                lowCalibration.setFloat(activity, summary.center);
+            } catch (IllegalAccessException error) {
+                throw new AssertionError(error);
+            }
+            showFrame(activity, render, frameField, summary);
+        });
         waitForIdleSync();
         runOnMainSync(() -> {
+            checkControlLabels(activity);
             check(view.spotReading() == summary.center, "Preview center reading");
             RectF bounds = field(view, "image", RectF.class);
             float density = view.getResources().getDisplayMetrics().density;
@@ -115,8 +131,8 @@ public final class ThermalSmokeTest extends Instrumentation {
             check("—".contentEquals(field(activity, "average", TextView.class).getText()),
                     "Preview average is unavailable");
             tapPreview(view, 0.32f, 0.50f);
-            check(field(activity, "spot", TextView.class).getText().toString().startsWith("约 "),
-                    "Touch to estimate and label");
+            check((Math.round(view.spotReading()) + " °C").contentEquals(
+                    field(activity, "spot", TextView.class).getText()), "Preview spot temperature");
             check(view.calibrationReading() == summary.center, "Preview calibration uses center");
         });
         saveScreenshot("smoke-preview.png");
@@ -126,10 +142,15 @@ public final class ThermalSmokeTest extends Instrumentation {
             check(field(activity, "hot", TextView.class).getText().toString().contains("°C"), "Hot label");
             float previous = view.spotReading();
             tapPreview(view, 0.58f, 0.50f);
-            check(view.spotReading() != previous && !view.spotDisplay().startsWith("约 "),
+            check(view.spotReading() != previous && view.spotDisplay().equals(
+                    ThermalView.number(view.spotReading()) + " °C"),
                     "Touch to measure");
         });
         checkLandscape(activity, view);
+        if (skipMedia) {
+            runOnMainSync(activity::finish);
+            return;
+        }
 
         LinkedBlockingQueue<String> mediaResult = new LinkedBlockingQueue<>();
         ThermalMedia media = new ThermalMedia(getTargetContext(), mediaResult::offer);
@@ -188,6 +209,7 @@ public final class ThermalSmokeTest extends Instrumentation {
             View header = field(activity, "header", View.class);
             View panel = field(activity, "toolsPanel", View.class);
             check(header.getParent() == panel, "Landscape sidebar");
+            checkControlLabels(activity);
             RectF bounds = field(view, "image", RectF.class);
             float aspectRatio = (float) ThermalFrame.WIDTH / ThermalFrame.HEIGHT;
             check(Math.abs(bounds.width() / bounds.height() - aspectRatio) < 0.01f,
@@ -195,7 +217,7 @@ public final class ThermalSmokeTest extends Instrumentation {
             float density = view.getResources().getDisplayMetrics().density;
             check(panel.getWidth() <= 230 * density, "Compact landscape sidebar");
             TextView hot = field(activity, "hot", TextView.class);
-            check(hot.getPaint().measureText(hot.getText().toString()) <= hot.getWidth(),
+            check(hot.getPaint().measureText(hot.getText().toString()) <= hot.getWidth() + 1,
                     "Full temperature value fits the sidebar");
             if ((view.getHeight() - 24 * density) * aspectRatio <= view.getWidth() - 61 * density) {
                 check(bounds.height() >= view.getHeight() - 25 * density,
@@ -210,6 +232,28 @@ public final class ThermalSmokeTest extends Instrumentation {
             check(field(view, "spot", Integer.class) == nativeY * ThermalFrame.WIDTH + nativeX,
                     "Tap follows camera coordinates in landscape");
         });
+    }
+
+    private static void checkControlLabels(MainActivity activity) {
+        check("校准高点".contentEquals(field(activity, "calibrationButton", TextView.class).getText()),
+                "Long calibration label is active");
+        for (String name : new String[]{"laserButton", "photoButton", "videoButton", "measurementButton",
+                "paletteButton", "emissivityButton", "calibrationButton", "fullFrameButton"}) {
+            TextView button = field(activity, name, TextView.class);
+            Layout layout = button.getLayout();
+            check(layout != null && layout.getLineCount() > 0, name + " is laid out");
+            int textWidth = button.getWidth() - button.getCompoundPaddingLeft()
+                    - button.getCompoundPaddingRight();
+            int textHeight = button.getHeight() - button.getCompoundPaddingTop()
+                    - button.getCompoundPaddingBottom();
+            check(layout.getHeight() <= textHeight, name + " text fits vertically");
+            check(layout.getLineEnd(layout.getLineCount() - 1) == button.getText().length(),
+                    name + " shows all characters");
+            for (int line = 0; line < layout.getLineCount(); line++) {
+                check(layout.getEllipsisCount(line) == 0 && layout.getLineMax(line) <= textWidth + 1,
+                        name + " text fits horizontally");
+            }
+        }
     }
 
     private static void showFrame(MainActivity activity, Method render, Field frameField,

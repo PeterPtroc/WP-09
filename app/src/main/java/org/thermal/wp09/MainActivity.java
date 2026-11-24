@@ -20,6 +20,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.text.InputType;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -29,6 +30,7 @@ import android.widget.ArrayAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -36,15 +38,20 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.widget.AppCompatTextView;
 import androidx.core.content.ContextCompat;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
+import androidx.core.widget.TextViewCompat;
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 
+import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.function.DoubleConsumer;
 
@@ -64,6 +71,8 @@ public final class MainActivity extends AppCompatActivity {
     private boolean started;
     private boolean requested;
     private boolean streaming;
+    private boolean capturingFullFrame;
+    private boolean viewingSnapshot;
     private boolean measuring = true;
     private boolean laser;
     private boolean laserBusy;
@@ -74,19 +83,28 @@ public final class MainActivity extends AppCompatActivity {
     private float emissivity;
     private long pluggedAt;
     private ThermalFrame frame;
+    private ThermalFrame liveFrame;
     private UsbSample pendingSample;
     private final ActivityResultLauncher<String> sampleDestination =
             registerForActivityResult(new ActivityResultContracts.CreateDocument("application/zip"),
                     this::saveUsbSample);
+    private ThermalFrame pendingTemperatureFrame;
+    private Calibration pendingTemperatureCalibration;
+    private final ActivityResultLauncher<String> temperatureDestination =
+            registerForActivityResult(new ActivityResultContracts.CreateDocument("text/csv"),
+                    this::saveTemperatureCsv);
     private Calibration calibration;
     private float lowCalibrationReading = Float.NaN;
     private float lowCalibrationReference;
     private ThermalView thermal;
     private LinearLayout root, header, metrics, body, toolsPanel;
+    private LinearLayout captureControls, settingsControls;
+    private ScrollView toolsScroll;
     private FrameLayout preview;
     private TextView status, empty, hot, cold, average, spot;
     private MaterialButton laserButton, measurementButton, calibrationButton, paletteButton;
     private MaterialButton emissivityButton, photoButton, videoButton;
+    private MaterialButton fullFrameButton;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -145,14 +163,18 @@ public final class MainActivity extends AppCompatActivity {
         setContentView(root);
 
         header = horizontal();
+        header.setBaselineAligned(false);
         header.setPadding(dp(10), 0, dp(10), 0);
         TextView title = text("WP-09 热成像", 17, TEXT);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        header.addView(title, new LinearLayout.LayoutParams(0, dp(44), 1));
+        title.setMinHeight(dp(44));
+        title.setPadding(0, dp(4), dp(8), dp(4));
+        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
         title.setGravity(Gravity.CENTER_VERTICAL);
         status = text("等待 USB", 12, MUTED);
         status.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
         status.setMaxWidth(dp(105));
+        status.setPadding(0, dp(4), 0, dp(4));
         status.setOnClickListener(view -> {
             if (!streaming && !requested) {
                 selected = null;
@@ -160,7 +182,13 @@ public final class MainActivity extends AppCompatActivity {
             }
         });
         status.setOnLongClickListener(view -> {
-            showUsbDiagnostics();
+            if (viewingSnapshot) {
+                pendingTemperatureFrame = frame;
+                pendingTemperatureCalibration = calibration;
+                temperatureDestination.launch("WP09-全图温度-摄氏.csv");
+            } else {
+                showUsbDiagnostics();
+            }
             return true;
         });
         header.addView(status);
@@ -189,29 +217,36 @@ public final class MainActivity extends AppCompatActivity {
         FrameLayout.LayoutParams emptyLayout = new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER);
         preview.addView(empty, emptyLayout);
         body.addView(preview);
+        toolsScroll = new ScrollView(this);
+        toolsScroll.setFillViewport(true);
+        body.addView(toolsScroll);
         toolsPanel = new LinearLayout(this);
         toolsPanel.setOrientation(LinearLayout.VERTICAL);
         toolsPanel.setGravity(Gravity.CENTER_VERTICAL);
-        body.addView(toolsPanel);
+        toolsScroll.addView(toolsPanel, new FrameLayout.LayoutParams(-1, -2));
 
-        LinearLayout capture = horizontal();
-        capture.setGravity(Gravity.CENTER);
-        capture.setPadding(dp(5), 0, dp(5), 0);
-        toolsPanel.addView(capture);
-        laserButton = control(capture, "激光", R.drawable.ic_zap, this::toggleLaser);
-        photoButton = control(capture, "拍照", R.drawable.ic_camera, () -> media.photo(thermal));
-        videoButton = control(capture, "录像", R.drawable.ic_video, this::toggleVideo);
-        measurementButton = control(capture, "测温", R.drawable.ic_thermometer, () -> {
+        captureControls = controlGroup();
+        LinearLayout laserAndPhoto = controlPair(captureControls);
+        laserButton = control(laserAndPhoto, "激光", R.drawable.ic_zap, this::toggleLaser);
+        photoButton = control(laserAndPhoto, "拍照", R.drawable.ic_camera, () -> media.photo(thermal));
+        LinearLayout videoAndMeasurement = controlPair(captureControls);
+        videoButton = control(videoAndMeasurement, "录像", R.drawable.ic_video, this::toggleVideo);
+        measurementButton = control(videoAndMeasurement, "测温", R.drawable.ic_thermometer, () -> {
             measuring = !measuring;
             render();
         });
 
-        LinearLayout settingsRow = horizontal();
-        settingsRow.setPadding(dp(5), 0, dp(5), dp(2));
-        toolsPanel.addView(settingsRow);
-        paletteButton = control(settingsRow, "", R.drawable.ic_palette, this::choosePalette);
-        emissivityButton = control(settingsRow, "", R.drawable.ic_sliders_horizontal, this::chooseEmissivity);
-        calibrationButton = control(settingsRow, "校准", R.drawable.ic_crosshair, this::chooseCalibration);
+        settingsControls = controlGroup();
+        settingsControls.setPadding(dp(5), 0, dp(5), dp(2));
+        LinearLayout paletteAndEmissivity = controlPair(settingsControls);
+        paletteButton = control(paletteAndEmissivity, "", R.drawable.ic_palette, this::choosePalette);
+        emissivityButton = control(paletteAndEmissivity, "", R.drawable.ic_sliders_horizontal,
+                this::chooseEmissivity);
+        LinearLayout calibrationAndFullFrame = controlPair(settingsControls);
+        calibrationButton = control(calibrationAndFullFrame, "校准", R.drawable.ic_crosshair,
+                this::chooseCalibration);
+        fullFrameButton = control(calibrationAndFullFrame, "全图", R.drawable.ic_thermal,
+                this::toggleFullFrame);
         updateLayout(getResources().getConfiguration());
         render();
     }
@@ -232,8 +267,11 @@ public final class MainActivity extends AppCompatActivity {
         body.setOrientation(wide ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
         preview.setLayoutParams(wide ? new LinearLayout.LayoutParams(0, -1, 1)
                 : new LinearLayout.LayoutParams(-1, 0, 1));
-        toolsPanel.setLayoutParams(wide ? new LinearLayout.LayoutParams(dp(228), -1)
+        toolsScroll.setLayoutParams(wide ? new LinearLayout.LayoutParams(dp(228), -1)
                 : new LinearLayout.LayoutParams(-1, -2));
+        float fontScale = Math.max(1, configuration.fontScale);
+        layoutControls(captureControls, !wide && configuration.screenWidthDp >= 248 * fontScale);
+        layoutControls(settingsControls, !wide && configuration.screenWidthDp >= 336 * fontScale);
         LinearLayout panel = wide ? toolsPanel : root;
         if (header.getParent() != panel) {
             LinearLayout previous = wide ? root : toolsPanel;
@@ -334,8 +372,11 @@ public final class MainActivity extends AppCompatActivity {
         pluggedAt = SystemClock.elapsedRealtime();
         camera.start(selected, next -> {
             streaming = true;
-            frame = next;
-            render();
+            liveFrame = next;
+            if (!viewingSnapshot) {
+                frame = next;
+                render();
+            }
             if (recording) media.frame(thermal, () -> {
                 recording = false;
                 recordingStarting = false;
@@ -353,12 +394,71 @@ public final class MainActivity extends AppCompatActivity {
         stopVideo();
         selected = null;
         frame = null;
+        liveFrame = null;
+        capturingFullFrame = false;
+        viewingSnapshot = false;
         requested = false;
         streaming = false;
         laser = false;
         laserBusy = false;
         lowCalibrationReading = Float.NaN;
         render();
+    }
+
+    private void toggleFullFrame() {
+        if (viewingSnapshot) {
+            viewingSnapshot = false;
+            frame = liveFrame;
+            render();
+            return;
+        }
+        if (!streaming || capturingFullFrame || recording || recordingStarting
+                || !CameraController.supportsFullFrame(selected)) return;
+        capturingFullFrame = true;
+        render();
+        camera.captureFullFrame(snapshot -> {
+            capturingFullFrame = false;
+            if (snapshot == null) {
+                message("全图读取失败，请重试");
+            } else {
+                frame = snapshot;
+                viewingSnapshot = true;
+                measuring = true;
+                message("点按选点，长按右上角导出温度");
+            }
+            render();
+        });
+    }
+
+    private void saveTemperatureCsv(Uri uri) {
+        ThermalFrame snapshot = pendingTemperatureFrame;
+        Calibration correction = pendingTemperatureCalibration;
+        pendingTemperatureFrame = null;
+        pendingTemperatureCalibration = null;
+        if (uri == null || snapshot == null || correction == null) return;
+        new Thread(() -> {
+            String result;
+            try {
+                OutputStream stream = getContentResolver().openOutputStream(uri, "w");
+                if (stream == null) throw new IOException("Temperature CSV destination is unavailable");
+                try (BufferedWriter writer = new BufferedWriter(
+                        new OutputStreamWriter(stream, StandardCharsets.UTF_8))) {
+                    for (int y = 0; y < ThermalFrame.HEIGHT; y++) {
+                        for (int x = 0; x < ThermalFrame.WIDTH; x++) {
+                            if (x != 0) writer.write(',');
+                            float value = correction.apply(snapshot.readings[y * ThermalFrame.WIDTH + x]);
+                            writer.write(Float.toString(Math.round(value * 10f) / 10f));
+                        }
+                        writer.newLine();
+                    }
+                }
+                result = "全图温度已导出";
+            } catch (IOException | SecurityException error) {
+                result = "全图温度导出失败";
+            }
+            String notice = result;
+            runOnUiThread(() -> message(notice));
+        }, "WP09 temperature export").start();
     }
 
     private void showUsbDiagnostics() {
@@ -465,6 +565,10 @@ public final class MainActivity extends AppCompatActivity {
             float value = (float) entered;
             if (value == emissivity) return;
             emissivity = value;
+            if (viewingSnapshot) {
+                viewingSnapshot = false;
+                frame = liveFrame;
+            }
             camera.setEmissivity(value);
             settings.edit().putFloat("emissivity", value).apply();
             if (calibration.applied) message("发射率已修改，原校准已重置");
@@ -563,9 +667,11 @@ public final class MainActivity extends AppCompatActivity {
         empty.setVisibility(frame == null ? View.VISIBLE : View.GONE);
         if (streaming) {
             String message;
-            if (recording) message = "正在录像";
+            if (capturingFullFrame) message = "读取全图";
+            else if (viewingSnapshot) message = "全图温度";
+            else if (recording) message = "正在录像";
             else if (valid && !frame.hasPixelTemperatures()) message = calibration.applied
-                    ? "预览估温 · 已校准" : "预览估温";
+                    ? "预览测温 · 已校准" : "预览测温";
             else if (valid) message = calibration.applied ? "已连接 · 已校准" : "已连接 · 未现场校准";
             else message = SystemClock.elapsedRealtime() - pluggedAt < 1500
                     ? "读取标定数据" : "图像已连接 · 无温度数据";
@@ -582,12 +688,17 @@ public final class MainActivity extends AppCompatActivity {
             videoButton.setIconResource(videoIcon);
             videoButton.setTag(videoIcon);
         }
-        button(videoButton, recording ? "停止" : "录像", streaming && !recordingStarting, recording);
+        button(videoButton, recording ? "停止" : "录像",
+                streaming && !recordingStarting && !capturingFullFrame && !viewingSnapshot, recording);
         button(measurementButton, "测温", true, measuring);
         button(paletteButton, ThermalView.PALETTE_NAMES[palette], true, false);
         button(emissivityButton, "ε " + emissivity, true, false);
         button(calibrationButton, Float.isFinite(lowCalibrationReading) ? "校准高点" : "校准",
                 shown, calibration.applied);
+        button(fullFrameButton, viewingSnapshot ? "实时" : "全图",
+                viewingSnapshot || (streaming && !capturingFullFrame && !recording
+                        && !recordingStarting && CameraController.supportsFullFrame(selected)),
+                viewingSnapshot);
     }
 
     private void showValue(TextView view, float celsius) {
@@ -600,7 +711,10 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void button(MaterialButton view, String label, boolean enabled, boolean active) {
-        setText(view, label);
+        if (!label.contentEquals(view.getText())) {
+            view.setText(label);
+            if (Build.VERSION.SDK_INT >= 26) view.setTooltipText(label);
+        }
         if (view.isEnabled() != enabled) view.setEnabled(enabled);
         if (view.isSelected() != active) view.setSelected(active);
     }
@@ -609,34 +723,63 @@ public final class MainActivity extends AppCompatActivity {
         LinearLayout column = new LinearLayout(this);
         column.setOrientation(LinearLayout.VERTICAL);
         column.setGravity(Gravity.CENTER);
+        column.setPadding(dp(3), dp(2), dp(3), dp(2));
+        column.setMinimumHeight(dp(44));
         TextView name = text(label, 11, MUTED);
         name.setGravity(Gravity.CENTER);
-        TextView value = text("—", 16, color);
+        TextView value = new AppCompatTextView(this);
+        value.setText("—");
+        value.setTextSize(16);
+        value.setTextColor(color);
         value.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         value.setGravity(Gravity.CENTER);
         value.setSingleLine();
         value.setHorizontallyScrolling(false);
-        if (Build.VERSION.SDK_INT >= 26) value.setAutoSizeTextTypeUniformWithConfiguration(
-                9, 16, 1, android.util.TypedValue.COMPLEX_UNIT_SP);
-        column.addView(name, new LinearLayout.LayoutParams(-1, dp(16)));
+        int largest = Math.round(value.getTextSize());
+        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(value,
+                Math.min(dp(9), largest - 1), largest, 1, TypedValue.COMPLEX_UNIT_PX);
+        column.addView(name, new LinearLayout.LayoutParams(-1, -2));
         column.addView(value, new LinearLayout.LayoutParams(-1, dp(25)));
-        row.addView(column, new LinearLayout.LayoutParams(0, dp(44), 1));
+        row.addView(column, new LinearLayout.LayoutParams(0, -1, 1));
         return value;
+    }
+
+    private LinearLayout controlGroup() {
+        LinearLayout group = new LinearLayout(this);
+        group.setBaselineAligned(false);
+        group.setPadding(dp(5), 0, dp(5), 0);
+        toolsPanel.addView(group, new LinearLayout.LayoutParams(-1, -2));
+        return group;
+    }
+
+    private LinearLayout controlPair(LinearLayout group) {
+        LinearLayout pair = horizontal();
+        pair.setBaselineAligned(false);
+        group.addView(pair);
+        return pair;
+    }
+
+    private void layoutControls(LinearLayout group, boolean singleRow) {
+        group.setOrientation(singleRow ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+        for (int i = 0; i < group.getChildCount(); i++) {
+            group.getChildAt(i).setLayoutParams(singleRow ? new LinearLayout.LayoutParams(0, -1, 1)
+                    : new LinearLayout.LayoutParams(-1, -2));
+        }
     }
 
     private MaterialButton control(LinearLayout group, String label, int icon, Runnable action) {
         MaterialButton button = new MaterialButton(this, null,
                 com.google.android.material.R.attr.materialButtonOutlinedStyle);
         button.setText(label);
-        button.setTextSize(11);
+        button.setTextSize(12);
         button.setGravity(Gravity.CENTER);
-        button.setSingleLine();
         button.setAllCaps(false);
         button.setLetterSpacing(0);
         button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         button.setMinWidth(0);
         button.setMinimumWidth(0);
-        button.setPadding(dp(2), 0, dp(2), 0);
+        button.setMinHeight(dp(48));
+        button.setPadding(dp(4), dp(6), dp(4), dp(6));
         button.setInsetTop(0);
         button.setInsetBottom(0);
         button.setCornerRadius(0);
@@ -654,7 +797,7 @@ public final class MainActivity extends AppCompatActivity {
         button.setBackgroundTintList(new ColorStateList(
                 new int[][]{{android.R.attr.state_selected}, {}}, new int[]{0xffdedede, PANEL}));
         button.setOnClickListener(view -> action.run());
-        LinearLayout.LayoutParams width = new LinearLayout.LayoutParams(0, dp(48), 1);
+        LinearLayout.LayoutParams width = new LinearLayout.LayoutParams(0, -1, 1);
         width.setMargins(dp(2), dp(2), dp(2), dp(2));
         group.addView(button, width);
         return button;

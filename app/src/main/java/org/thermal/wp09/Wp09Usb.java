@@ -9,6 +9,7 @@ final class Wp09Usb {
                            long[] outputHandle);
     static native int read(long handle, byte[] frame);
     static native byte[] sample(long handle);
+    static native byte[] captureRawDump(long handle, byte[] reference);
     static native int laser(long handle, boolean enabled);
     static native void close(long handle);
     static native boolean temperatureTable(byte[] frame, float[] table, float emissivity);

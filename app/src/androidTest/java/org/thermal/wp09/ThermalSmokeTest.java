@@ -126,6 +126,10 @@ public final class ThermalSmokeTest extends Instrumentation {
         MainActivity activity = (MainActivity) startActivitySync(intent);
         waitForIdleSync();
         ThermalView view = field(activity, "thermal", ThermalView.class);
+        MaterialButton laser = field(activity, "laserButton", MaterialButton.class);
+        boolean noDevice = field(activity, "selected", android.hardware.usb.UsbDevice.class) == null;
+        if (noDevice) runOnMainSync(() -> check(!laser.isEnabled() && "开启激光".contentEquals(laser.getText()),
+                "Disconnected laser shortcut"));
         runOnMainSync(() -> activity.receive(summary));
         waitForIdleSync();
         runOnMainSync(() -> {
@@ -140,6 +144,12 @@ public final class ThermalSmokeTest extends Instrumentation {
             View freeze = field(activity, "pauseButton", View.class);
             freeze.performClick();
             check(view.capture().frame == summary, "Freeze retains the UVC frame actually drawn");
+            if (noDevice) {
+                check(laser.isEnabled(), "Laser shortcut is available while frozen");
+                laser.performClick();
+                check(laser.isEnabled() && !laser.isSelected() && "开启激光".contentEquals(laser.getText()),
+                        "Unconfirmed laser command retains last state and allows retry");
+            }
             activity.receive(frame);
             check(view.capture().frame == summary, "Later delivery cannot replace a frozen preview");
             freeze.performClick();
@@ -1009,7 +1019,13 @@ public final class ThermalSmokeTest extends Instrumentation {
             saved = latestMovie();
         }
         check(saved != null && !saved.equals(before), "Stop publishes the one-tap recording");
+        // The photo and video are published independently on different workers.
+        deadline = SystemClock.uptimeMillis() + 5000;
         Uri still = latestPhoto();
+        while (java.util.Objects.equals(beforePhoto, still) && SystemClock.uptimeMillis() < deadline) {
+            SystemClock.sleep(30);
+            still = latestPhoto();
+        }
         check(still != null && !still.equals(beforePhoto), "Recording snapshot saved");
         try (InputStream in = getTargetContext().getContentResolver().openInputStream(still)) {
             ThermalCapture restored = RadiometricPng.read(in);

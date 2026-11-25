@@ -61,11 +61,9 @@ public final class MainActivity extends AppCompatActivity {
     private boolean started;
     private boolean requested;
     private boolean streaming;
-    private boolean capturingFullFrame;
-    private boolean viewingSnapshot;
     private boolean measuring = true;
     private boolean paused, pullingVideoMaps, readingVideoBatch;
-    private long lastPanelAt, mapRateStartNs, snapshotReadMs;
+    private long lastPanelAt, mapRateStartNs;
     private int mapsReceived, pendingVideoBatches;
     private String mapRate = "";
     private final TemperatureAlarm alarms = new TemperatureAlarm();
@@ -78,7 +76,6 @@ public final class MainActivity extends AppCompatActivity {
     private int palette;
     private float emissivity;
     private ThermalFrame frame;
-    private ThermalFrame previousStill;
     private ThermalFrame liveFrame;
     private UsbSample pendingSample;
     private final ActivityResultLauncher<String> sampleDestination =
@@ -96,7 +93,7 @@ public final class MainActivity extends AppCompatActivity {
     private LinearLayout root;
     private InspectionPanel inspection;
     private TextView status, empty, fps, alarmBanner;
-    private MaterialButton photoButton, videoButton, galleryButton, pauseButton, shutterButton, fullFrameButton;
+    private MaterialButton photoButton, videoButton, galleryButton, pauseButton, shutterButton, laserButton;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -184,10 +181,10 @@ public final class MainActivity extends AppCompatActivity {
         panel.addView(status);
         status.setOnClickListener(v -> { if (!streaming && !requested) { selected = null; discover(); } });
         View.OnLongClickListener diagnostic = v -> {
-            if (frame != null && frame.hasPixelTemperatures() && (viewingSnapshot || paused)) {
+            if (paused && frame != null && frame.hasPixelTemperatures()) {
                 pendingTemperatureFrame = frame;
                 pendingTemperatureCalibration = calibration;
-                temperatureDestination.launch(frame.thermalOutput ? "WP09-全图温度-摄氏.csv" : "WP09-原始估温-摄氏.csv");
+                temperatureDestination.launch(frame.thermalOutput ? "WP09-温度-摄氏.csv" : "WP09-估算温度-摄氏.csv");
             } else showUsbDiagnostics();
             return true;
         };
@@ -207,7 +204,7 @@ public final class MainActivity extends AppCompatActivity {
         LinearLayout rangeRow = row(this);
         panel.addView(rangeRow);
         pauseButton = action(rangeRow, "定格", R.drawable.ic_pause, () -> {
-            if (viewingSnapshot || paused) resumePreview();
+            if (paused) resumePreview();
             else if (thermal.drawnFrame() != null) {
                 frame = thermal.drawnFrame();
                 paused = true;
@@ -218,7 +215,7 @@ public final class MainActivity extends AppCompatActivity {
         shutterButton = action(rangeRow, "快门校准", R.drawable.ic_crosshair, this::triggerShutter);
         LinearLayout options = row(this);
         panel.addView(options);
-        fullFrameButton = action(options, "全图", R.drawable.ic_grid, this::toggleFullFrame);
+        laserButton = action(options, "开启激光", R.drawable.ic_zap, this::toggleLaser);
         action(options, "设置", R.drawable.ic_sliders_horizontal, this::settingsMenu);
         render();
     }
@@ -226,7 +223,7 @@ public final class MainActivity extends AppCompatActivity {
     private void settingsMenu() {
         String[] entries = {"色彩　" + ThermalCapture.PALETTE_NAMES[palette], "高低温提醒",
                 "发射率　" + emissivity, Float.isFinite(lowCalibrationReading) ? "校准高点" : "参考温度校准",
-                laser ? "关闭激光" : "开启激光", measuring ? "隐藏测量标记" : "显示测量标记",
+                measuring ? "隐藏测量标记" : "显示测量标记",
                 "复位画面"};
         dialog().setTitle("设置").setItems(entries, (d, i) -> {
             switch (i) {
@@ -235,9 +232,8 @@ public final class MainActivity extends AppCompatActivity {
                 case 2: chooseEmissivity(); break;
                 case 3: if (frame != null && frame.hasTemperature()) chooseCalibration();
                         else message("等待测温数据"); break;
-                case 4: if (streaming) toggleLaser(); else message("请连接 WP-09"); break;
-                case 5: measuring = !measuring; render(); break;
-                case 6: thermal.resetViewport(); break;
+                case 4: measuring = !measuring; render(); break;
+                case 5: thermal.resetViewport(); break;
             }
         }).show();
     }
@@ -354,7 +350,7 @@ public final class MainActivity extends AppCompatActivity {
 
     private void connect() {
         status.setText("正在连接");
-        empty.setText("正在读取全图测温");
+        empty.setText("正在读取温度");
         camera.start(selected, this::receive, message -> {
             disconnect();
             status.setText("连接失败");
@@ -367,7 +363,7 @@ public final class MainActivity extends AppCompatActivity {
         streaming = true;
         liveFrame = next;
         if (!(recording && pullingVideoMaps)) checkAlarm(next);
-        if (!viewingSnapshot && !paused) {
+        if (!paused) {
             frame = next;
             thermal.show(frame, calibration, measuring);
             long now = SystemClock.elapsedRealtime();
@@ -383,13 +379,10 @@ public final class MainActivity extends AppCompatActivity {
         selected = null;
         frame = null;
         liveFrame = null;
-        previousStill = null;
         paused = false;
         thermal.resetViewport();
         inspection.reset();
         checkAlarm(null);
-        capturingFullFrame = false;
-        viewingSnapshot = false;
         requested = false;
         streaming = false;
         laser = false;
@@ -399,66 +392,14 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void resumePreview() {
-        previousStill = null;
-        paused = viewingSnapshot = false;
+        paused = false;
         frame = liveFrame;
         inspection.reset();
         render();
     }
 
-    private void toggleFullFrame() {
-        if (viewingSnapshot) {
-            if (previousStill == null) resumePreview();
-            else {
-                frame = previousStill;
-                previousStill = null;
-                paused = true;
-                viewingSnapshot = false;
-                inspection.reset();
-                render();
-            }
-            return;
-        }
-        ThermalFrame visible = paused ? frame : thermal.drawnFrame();
-        if (visible != null && visible.hasPixelTemperatures()) {
-            frame = visible;
-            snapshotReadMs = 0;
-            paused = false;
-            viewingSnapshot = true;
-            render();
-        } else captureMap(false);
-    }
-
     private void takePhoto() {
-        ThermalCapture visible = thermal.drawnCapture();
-        if (visible == null || capturingFullFrame || recordingStarting) return;
-        if (!paused && !visible.frame.hasPixelTemperatures() && CameraController.supportsFullFrame(selected)) {
-            if (recording) return;
-            captureMap(true);
-        } else media.photo(visible, !recording);
-    }
-
-    private void captureMap(boolean save) {
-        if (capturingFullFrame || !streaming || !CameraController.supportsFullFrame(selected)) return;
-        capturingFullFrame = true;
-        Calibration correction = calibration;
-        long startedAt = SystemClock.elapsedRealtime();
-        render();
-        camera.captureFullFrame(snapshot -> {
-            capturingFullFrame = false;
-            if (snapshot == null) message("未取得全图，请重试");
-            else if (save) media.photo(thermal.compose(snapshot, correction));
-            else {
-                previousStill = paused ? frame : null;
-                frame = snapshot;
-                snapshotReadMs = SystemClock.elapsedRealtime() - startedAt;
-                paused = false;
-                viewingSnapshot = true;
-                measuring = true;
-                inspection.reset();
-            }
-            render();
-        });
+        if (streaming && !recordingStarting) media.photo(thermal.drawnCapture(), !recording);
     }
 
     private void saveTemperatureCsv(Uri uri) {
@@ -483,9 +424,9 @@ public final class MainActivity extends AppCompatActivity {
                         writer.newLine();
                     }
                 }
-                result = "全图温度已导出";
+                result = "温度已导出";
             } catch (IOException | SecurityException error) {
-                result = "全图温度导出失败";
+                result = "温度导出失败";
             }
             String notice = result;
             runOnUiThread(() -> message(notice));
@@ -534,14 +475,14 @@ public final class MainActivity extends AppCompatActivity {
         camera.setLaser(enabled, ok -> {
             laserBusy = false;
             if (ok) laser = enabled;
-            else message("激光指令未确认");
+            else message("激光状态未确认，请重试");
             render();
         });
     }
 
     private void toggleVideo() {
         if (recording) { stopVideo(); render(); return; }
-        if (recordingStarting || !streaming || paused || viewingSnapshot || capturingFullFrame || frame == null) return;
+        if (recordingStarting || !streaming || paused || frame == null) return;
         pullingVideoMaps = CameraController.supportsFullFrame(selected);
         if (!pullingVideoMaps && !frame.hasPixelTemperatures()) return;
         mapRateStartNs = System.nanoTime();
@@ -568,12 +509,12 @@ public final class MainActivity extends AppCompatActivity {
         if (request != recordingRequest || !recording || readingVideoBatch || pendingVideoBatches >= 2) return;
         readingVideoBatch = true;
         Calibration correction = calibration;
-        camera.captureMaps(true, frames -> {
+        camera.captureVideoBatch(frames -> {
             if (request != recordingRequest || !recording) return;
             readingVideoBatch = false;
             if (frames.length == 0) {
                 stopVideo();
-                message("全图取样中断");
+                message("测温数据中断");
                 render();
                 return;
             }
@@ -585,7 +526,7 @@ public final class MainActivity extends AppCompatActivity {
             mapsReceived += frames.length;
             long now = System.nanoTime();
             if (now - mapRateStartNs >= 1_000_000_000L) {
-                mapRate = ThermalView.number(mapsReceived * 1_000_000_000f / (now - mapRateStartNs)) + " 测温帧/秒";
+                mapRate = ThermalView.number(mapsReceived * 1_000_000_000f / (now - mapRateStartNs)) + " 帧/秒";
                 mapsReceived = 0;
                 mapRateStartNs = now;
                 render();
@@ -647,9 +588,8 @@ public final class MainActivity extends AppCompatActivity {
             float value = (float) entered;
             if (value == emissivity) return;
             emissivity = value;
-            if (viewingSnapshot || paused) {
-                previousStill = null;
-                viewingSnapshot = paused = false;
+            if (paused) {
+                paused = false;
                 frame = liveFrame;
             }
             camera.setEmissivity(value);
@@ -752,40 +692,37 @@ public final class MainActivity extends AppCompatActivity {
         empty.setVisibility(frame == null ? View.VISIBLE : View.GONE);
         inspection.setVisibility(measuring ? View.VISIBLE : View.GONE);
         if (measuring) inspection.refresh(frame == null ? 0 : frame.capturedNanos / 1_000_000, true);
-        boolean valid = frame != null && frame.hasTemperature();
         if (streaming) {
             String state;
             if (shutterBusy) state = recording ? "录像 · 快门校准中" : "快门校准中";
             else if (recording) state = mapRate.isEmpty() ? "正在录像" : "录像 · " + mapRate;
-            else if (capturingFullFrame) state = "正在读取全图…";
-            else if (viewingSnapshot) state = thermal.capture().source()
-                    + (snapshotReadMs > 0 ? " · " + snapshotReadMs + " ms" : "");
-            else if (paused) state = "已定格 · " + thermal.capture().source();
-            else state = thermal.capture() == null ? "读取画面" : thermal.capture().source();
+            else if (paused) state = "已定格";
+            else state = frame != null && frame.hasTemperature() ? "实时预览" : "无温度数据";
             label(status, state);
         }
-        label(fps, streaming && !viewingSnapshot && !paused && thermal.fps() > 0
+        label(fps, streaming && !paused && thermal.fps() > 0
                 ? thermal.fps() + " fps" : "");
         boolean mapAvailable = CameraController.supportsFullFrame(selected);
-        photoButton.setEnabled(frame != null && !capturingFullFrame && !recordingStarting
-                && !(recording && mapAvailable && !frame.hasPixelTemperatures()));
-        videoButton.setEnabled(recording || (streaming && !paused && !viewingSnapshot && !capturingFullFrame
+        photoButton.setEnabled(frame != null && !recordingStarting);
+        videoButton.setEnabled(recording || (streaming && !paused
                 && !recordingStarting && (mapAvailable || (frame != null && frame.hasPixelTemperatures()))));
         if (videoButton.isSelected() != recording) {
             videoButton.setSelected(recording);
             videoButton.setIconResource(recording ? R.drawable.ic_square : R.drawable.ic_video);
         }
         label(videoButton, recording ? "停止" : "录像");
-        galleryButton.setEnabled(!recording && !recordingStarting && !capturingFullFrame);
-        pauseButton.setEnabled(frame != null && !recording && !recordingStarting && !capturingFullFrame);
-        pauseButton.setSelected(paused || viewingSnapshot);
-        label(pauseButton, paused || viewingSnapshot ? "实时" : "定格");
+        galleryButton.setEnabled(!recording && !recordingStarting);
+        pauseButton.setEnabled(frame != null && !recording && !recordingStarting);
+        pauseButton.setSelected(paused);
+        label(pauseButton, paused ? "实时" : "定格");
         shutterButton.setEnabled(streaming && mapAvailable && !shutterBusy);
-        fullFrameButton.setEnabled(streaming && !capturingFullFrame && !recording && !recordingStarting
-                && (mapAvailable || (valid && frame.hasPixelTemperatures())));
-        fullFrameButton.setSelected(viewingSnapshot);
-        label(fullFrameButton, viewingSnapshot ? (previousStill == null ? "返回实时" : "返回定格")
-                : paused && mapAvailable && !frame.hasPixelTemperatures() ? "新拍全图" : "全图");
+        laserButton.setEnabled(streaming && !laserBusy);
+        if (laserButton.isSelected() != laser) {
+            laserButton.setSelected(laser);
+            String action = laser ? "关闭激光" : "开启激光";
+            label(laserButton, action);
+            if (Build.VERSION.SDK_INT >= 26) laserButton.setTooltipText(action);
+        }
 
         if (alarms.state == 0 && alarmBanner.getVisibility() != View.GONE) alarmBanner.setVisibility(View.GONE);
     }

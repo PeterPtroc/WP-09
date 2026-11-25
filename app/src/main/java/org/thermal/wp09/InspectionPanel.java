@@ -131,7 +131,7 @@ final class InspectionPanel extends LinearLayout {
         boolean estimated = c != null && !c.frame.thermalOutput && c.frame.hasTemperature();
         boolean centerPair = point && c != null && !c.frame.hasPixelTemperatures() && m.start == ThermalFrame.CENTER
                 && m.start != c.frame.hot && m.start != c.frame.cold;
-        label(name, point ? (centerPair ? "中心双点" : "选点") : m.tool == Measurement.Tool.LINE ? "线均温" : "区域均温");
+        label(name, point ? (centerPair ? "中心温度" : "选点") : m.tool == Measurement.Tool.LINE ? "线均温" : "区域均温");
         label(value, point ? thermal.spotDisplay() : m.count == 0 ? "—"
                 : (estimated ? "≈" : "") + ThermalView.number(m.mean) + " °C");
         labelMarker(hotMarker, "最高温", c, true);
@@ -141,11 +141,11 @@ final class InspectionPanel extends LinearLayout {
             summary = "选区   ↓ " + ThermalView.number(m.minimum) + "°   ↑ " + ThermalView.number(m.maximum) + "°";
         } else if (c != null && c.frame.firmware != null && m.count == 0 && c.frame.measurable(m.start)
                 && Float.isFinite(c.frame.readings[m.start])) {
-            summary = "原始估温 " + ThermalView.number(c.calibration.apply(c.frame.readings[m.start])) + "° 超出固件范围";
+            summary = "估算 " + ThermalView.number(c.calibration.apply(c.frame.readings[m.start])) + "°，超出画面温度范围";
         } else if (c != null && c.frame.firmware != null) {
-            summary = "固件中心 " + ThermalView.number(c.calibration.apply(c.frame.reported.center)) + "°";
+            summary = "中心温度 " + ThermalView.number(c.calibration.apply(c.frame.reported.center)) + "°";
         } else if (c != null && c.frame.thermalOutput) {
-            summary = "全图均温 " + ThermalView.number(c.calibration.apply(c.frame.average)) + "°";
+            summary = "画面均温 " + ThermalView.number(c.calibration.apply(c.frame.average)) + "°";
         }
         label(stats, summary);
         stats.setVisibility(summary.isEmpty() ? View.GONE : View.VISIBLE);

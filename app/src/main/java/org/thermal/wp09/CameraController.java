@@ -61,11 +61,7 @@ final class CameraController {
         return "XWild_WP09_C".equals(device.getProductName());
     }
 
-    void captureFullFrame(Consumer<ThermalFrame> callback) {
-        captureMaps(false, frames -> callback.accept(frames.length == 0 ? null : frames[frames.length - 1]));
-    }
-
-    void captureMaps(boolean burst, Consumer<ThermalFrame[]> callback) {
+    void captureVideoBatch(Consumer<ThermalFrame[]> callback) {
         Session session = current;
         if (session == null || !supportsFullFrame(session.device)) {
             callback.accept(new ThermalFrame[0]);
@@ -81,9 +77,9 @@ final class CameraController {
                 synchronized (session.readLock) {
                     session.readingThermal = session.identifiedThermalOutput && generation == session.movieGeneration;
                 }
-                if (session.readingThermal) session.readThermal(frames, burst, captureEmissivity, generation);
+                if (session.readingThermal) session.readThermal(frames, captureEmissivity, generation);
             } finally {
-                if (!burst || frames.isEmpty() || generation != session.movieGeneration) session.readingThermal = false;
+                if (frames.isEmpty() || generation != session.movieGeneration) session.readingThermal = false;
                 session.capturing = false;
             }
             main.post(() -> {
@@ -201,7 +197,7 @@ final class CameraController {
                 // A previous client may have left the device in thermal or raw output mode.
                 if (xwild) {
                     if (!Wp09Usb.setThermalOutput(handle, false)) {
-                        fail("无法读取固件测温参考");
+                        fail("无法读取相机测温数据");
                         return;
                     }
                     // Each open has its own USB request queue. UVC owns the first connection.
@@ -224,7 +220,7 @@ final class CameraController {
             }
         }
 
-        void readThermal(ArrayList<ThermalFrame> frames, boolean burst, float captureEmissivity, int generation) {
+        void readThermal(ArrayList<ThermalFrame> frames, float captureEmissivity, int generation) {
             // A shutter correction can briefly pause exposures. Keep the recording open through that gap.
             long deadline = SystemClock.elapsedRealtime() + 5000;
             while (current == this && generation == movieGeneration && SystemClock.elapsedRealtime() < deadline) {
@@ -236,8 +232,8 @@ final class CameraController {
                 lastReceived = SystemClock.elapsedRealtime();
                 if (frames.isEmpty()) deadline = lastReceived + 1000;
                 frames.add(frame);
-                if (burst && generation == movieGeneration) present(frame);
-                if (!burst || frames.size() == 8) break;
+                if (generation == movieGeneration) present(frame);
+                if (frames.size() == 8) break;
             }
         }
 
@@ -312,7 +308,7 @@ final class CameraController {
                 present(decoded);
             } else if (!capturing && now - lastReceived > 5000) {
                 worker.post(() -> {
-                    if (current == this) fail(xwild ? "未收到可校验的全图测温数据，点连接状态重试"
+                    if (current == this) fail(xwild ? "未收到有效测温数据，点连接状态重试"
                             : unexpectedFrameBytes == 0 ? "WP-09 未传输画面，请重新插入设备"
                             : "设备返回了未识别的帧格式（" + unexpectedFrameBytes + " 字节）");
                 });

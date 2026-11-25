@@ -93,15 +93,6 @@ final class ThermalCapture {
                 ThermalFrame.WIDTH - frame.firstColumn, ThermalFrame.HEIGHT, Bitmap.Config.ARGB_8888);
     }
 
-    String source() {
-        if (frame.thermalOutput) return "固件全图";
-        if (frame.firmware != null) return "固件三点 · 其余原始估温";
-        if (frame.hasPixelTemperatures()) return "原始估温";
-        if (frame.hasTemperature() && frame.cold < 0 && frame.hot < 0) return "中心测温";
-        if (frame.hasTemperature() && (frame.cold < 0 || frame.hot < 0)) return "两点测温 · 区间内估算";
-        return frame.hasTemperature() ? "三点测温 · 其余估算" : "无温度数据";
-    }
-
     static GradientDrawable swatch(int palette) {
         return new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, STOPS[palette]);
     }

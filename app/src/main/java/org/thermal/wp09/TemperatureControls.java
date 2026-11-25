@@ -24,7 +24,7 @@ final class TemperatureControls {
         panel.addView(inputs);
         EditText a = input(inputs, "低温提醒", low);
         EditText b = input(inputs, "高温提醒", high);
-        AlertDialog dialog = new MaterialAlertDialogBuilder(c).setTitle("全图温度提醒 · °C")
+        AlertDialog dialog = new MaterialAlertDialogBuilder(c).setTitle("高低温提醒 · °C")
                 .setView(panel).setNegativeButton("取消", null)
                 .setNeutralButton("全部关闭", (d, w) -> apply.range(Float.NaN, Float.NaN))
                 .setPositiveButton("应用", null).create();

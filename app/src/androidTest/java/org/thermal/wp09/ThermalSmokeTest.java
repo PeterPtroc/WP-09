@@ -43,6 +43,8 @@ import java.util.zip.ZipInputStream;
 public final class ThermalSmokeTest extends Instrumentation {
     private boolean skipMedia, exportFieldFrames, exportMobileMovie, directReplay;
     private int seconds = 4;
+    private boolean doubleReplay;
+    private long[] expectedDisplay;
     private byte[] rawDump, reference;
     private ThermalFrame[] recorded;
     private final StringBuilder report = new StringBuilder();
@@ -53,6 +55,7 @@ public final class ThermalSmokeTest extends Instrumentation {
         exportFieldFrames = options != null && "true".equals(options.getString("exportFieldFrames"));
         exportMobileMovie = options != null && "true".equals(options.getString("exportMobileMovie"));
         directReplay = options != null && "true".equals(options.getString("directReplay"));
+        doubleReplay = directReplay && "true".equals(options.getString("doubleReplay"));
         if (options != null && options.containsKey("replaySeconds")) {
             seconds = Math.max(2, Math.min(120, Integer.parseInt(options.getString("replaySeconds"))));
         }
@@ -119,6 +122,7 @@ public final class ThermalSmokeTest extends Instrumentation {
         check(!decoder.decode(new byte[ThermalFrame.BYTES], 0.98f).hasTemperature(), "Image-only stream");
         checkThermalOutput(decoder, wire, preview, summary);
         checkShutterGate(decoder, wire);
+        checkLiveImaging(decoder, wire);
         Calibration calibration = Calibration.twoPoint(20, 24, 50, 57);
         check(Math.abs(calibration.apply(35) - 40.5f) < 0.01f, "Two-point calibration");
 
@@ -163,6 +167,7 @@ public final class ThermalSmokeTest extends Instrumentation {
             check(view.spotDisplay().equals(ThermalView.number(view.spotReading()) + " °C"), "Exact spot");
             checkZoom(view);
             checkLabels(view, frame, calibration);
+            checkLoupe(view, frame);
         });
         checkLandscape(activity, view);
         checkMeasurement(frame, calibration);
@@ -294,6 +299,11 @@ public final class ThermalSmokeTest extends Instrumentation {
         BlindPixels defects = BlindPixels.fromFactory(new byte[ThermalFrame.PIXELS * 4]);
         ThermalFrame scene = decoder.decodeThermalOutput(wire, .98f, 0, defects);
         gate.verified(scene);
+        byte[] transition = wire.clone();
+        ByteBuffer edge = ByteBuffer.wrap(transition).order(ByteOrder.LITTLE_ENDIAN);
+        for (int p = 0; p < 64 * ThermalFrame.WIDTH; p++) edge.putShort(p * 2, (short) 7100);
+        ThermalFrame partial = decoder.decodeThermalOutput(transition, .98f, 10_000_000L, defects);
+        check(gate.suspect(partial, transition), "Partly closed shutter is held before the whole image flattens");
         byte[] closed = wire.clone();
         ByteBuffer words = ByteBuffer.wrap(closed).order(ByteOrder.LITTLE_ENDIAN);
         for (int i = 0; i < ThermalFrame.PIXELS; i++) words.putShort(i * 2, (short) 7100);
@@ -370,14 +380,15 @@ public final class ThermalSmokeTest extends Instrumentation {
     }
 
     private static void checkPayload(ThermalFrame source, Calibration calibration) throws Exception {
-        float lo = source.hasPixelTemperatures() && !source.hasFirmwareImage() ? 10 : Float.NaN;
+        float lo = source.hasPixelTemperatures() && source.preview == null ? 10 : Float.NaN;
         float hi = Float.isFinite(lo) ? 80 : Float.NaN;
         ThermalCapture capture = new ThermalCapture(source, calibration, 1, lo, hi);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         RadiometricPng.write(out, capture);
         byte[] png = out.toByteArray();
         Bitmap bitmap = BitmapFactory.decodeByteArray(png, 0, png.length);
-        check(bitmap != null && bitmap.getWidth() == 256 - source.firstColumn && bitmap.getHeight() == 192,
+        check(bitmap != null && bitmap.getWidth() == (256 - source.firstColumn) * source.displayScale()
+                        && bitmap.getHeight() == 192 * source.displayScale(),
                 "Stock PNG decoder sees only the active field");
         ThermalCapture saved = RadiometricPng.read(new ByteArrayInputStream(png));
         check(saved != null && saved.palette == 1 && saved.calibration.scale == calibration.scale
@@ -403,6 +414,120 @@ public final class ThermalSmokeTest extends Instrumentation {
             RadiometricPng.read(new ByteArrayInputStream(png));
             throw new AssertionError("Damaged thermal PNG accepted");
         } catch (IOException expected) { /* ancillary checksum */ }
+    }
+
+    private void checkLiveImaging(ThermalFrame.Decoder decoder, byte[] wire) throws Exception {
+        byte[] kb = new byte[ThermalFrame.PIXELS * 4];
+        BlindPixels factory = BlindPixels.fromFactory(kb);
+        android.content.SharedPreferences prefs = getTargetContext().getSharedPreferences("smoke-sites", 0);
+        prefs.edit().clear().commit();
+        CameraRepairs a = new CameraRepairs(prefs, "A", kb, factory);
+        CameraRepairs b = new CameraRepairs(prefs, "B", kb, factory);
+        ThermalFrame original = decoder.decodeThermalOutput(wire.clone(), .98f, 1, factory);
+        int site = original.hot;
+        check(a.change(site, false) && new CameraRepairs(prefs, "A", kb, factory).current.sites[0] == site
+                && b.current.sites.length == 0, "Repair persists for only its camera");
+        byte[] damaged = wire.clone();
+        ByteBuffer.wrap(damaged).order(ByteOrder.LITTLE_ENDIAN).putShort(site * 2, (short) 15000);
+        ThermalFrame verified = decoder.decodeThermalOutput(damaged, .98f, 10, factory);
+        ThermalFrame repaired = decoder.repair(damaged, verified, a.current.correction);
+        check(repaired.readings[site] < verified.readings[site] && repaired.maximum < verified.maximum,
+                "Correct AD before reading the temperature table and finding extrema");
+        for (int i = 0; i < ThermalFrame.PIXELS; ++i)
+            if (i != site) check(repaired.readings[i] == verified.readings[i], "Only the marked site changes");
+        java.util.HashSet<Integer> signatures = new java.util.HashSet<>();
+        for (int scene = 0; scene < LiveImage.SCENES.length; ++scene) for (int palette : new int[]{4,5}) {
+            LiveImage.Settings tuning = new LiveImage.Settings(scene, palette, true);
+            ThermalFrame out = new LiveImage().process(repaired, tuning, .98f, a.current.sites);
+            check(out.readings == repaired.readings && out.cold == repaired.cold && out.hot == repaired.hot &&
+                    out.center == repaired.center && out.isEstimatedAt(site) && out.preview.length == 4 * ThermalFrame.PIXELS,
+                    "Display processing preserves every measured point and correction provenance");
+            signatures.add(Arrays.hashCode(out.preview));
+            if (scene == 1 && palette == 4) checkPayload(out, Calibration.DEFAULT);
+        }
+        check(signatures.size() == 6, "Scene and polarity each select a distinct rendering");
+        java.util.HashSet<Integer> colors = new java.util.HashSet<>();
+        for (int i = 4; i < ThermalCapture.PALETTE_NAMES.length; i++)
+            colors.add(Arrays.hashCode(ThermalCapture.STOPS[i]));
+        check(colors.size() == 11 && ThermalCapture.STOPS[4].length == 256, "All OEM 256-entry tables loaded");
+        check(a.change(site, false) && a.current.sites.length == 0, "Restore individual defect");
+
+        LiveImage stream = new LiveImage();
+        LiveImage.Settings tuning = new LiveImage.Settings(0, 4, false);
+        java.util.Random random = new java.util.Random(17);
+        double filtered = 0, currentOnly = 0;
+        byte[] previous = null, previousSingle = null;
+        for (int t = 0; t < 14; t++) {
+            float[] noisy = new float[ThermalFrame.PIXELS];
+            for (int i = 0; i < noisy.length; i++)
+                noisy[i] = 25f + (i % 256 > (t < 7 ? 130 : 185) ? 3f : 0) + (random.nextFloat() - .5f) * .35f;
+            long stamp = t * 20_000_000L;
+            ThermalFrame sample = new ThermalFrame(noisy, null, 0, 255, 24.8f, 28.2f, 25f, 26f, stamp, null, 0, true);
+            byte[] single = new LiveImage().process(sample, tuning, .98f, BlindPixels.NONE).preview;
+            ThermalFrame output = stream.process(sample, tuning, .98f, BlindPixels.NONE);
+            if (t == 7) {
+                int location = 90 * 256 + 150;
+                check(Math.abs((output.preview[location] & 255) - (single[location] & 255)) < 4,
+                        "Moving edge loses history on its first changed frame");
+            }
+            if (previous != null) for (int y = 10; y < 180; y += 2) for (int x = 10; x < 120; x += 2) {
+                int i = y * 256 + x;
+                currentOnly += Math.abs((single[i] & 255) - (previousSingle[i] & 255));
+                filtered += Math.abs((output.preview[i] & 255) - (previous[i] & 255));
+            }
+            previous = output.preview;
+            previousSingle = single;
+            if (t == 13) {
+                ThermalFrame afterGap = new ThermalFrame(noisy, null, 0, 255, 24.8f, 28.2f, 25f, 26f,
+                        stamp + 200_000_000L, null, 0, true);
+                check(Arrays.equals(stream.process(afterGap, tuning, .98f, BlindPixels.NONE).preview, single),
+                        "No temporal carryover after a gap");
+            }
+        }
+        check(filtered < currentOnly * .90, "Temporal filtering reduces flat-field flicker: " + filtered + "/" + currentOnly);
+        checkSubpixelReconstruction();
+        report.append("6 scene/polarity profiles, 11 palettes, local repairs and motion-aware filtering checked. ");
+    }
+
+    private static void checkSubpixelReconstruction() {
+        int n = ThermalFrame.PIXELS;
+        float[] field = new float[n], history = new float[n];
+        byte[] gray = new byte[n], shifted = new byte[n], single = new byte[n * 4], fused = single.clone();
+        for (int i = 0; i < n; i++) {
+            int x = i % 256, y = i / 256;
+            field[i] = (float)(25 + Math.sin(.32*x+.15*y) + Math.cos(.23*x-.38*y));
+        }
+        PixelOps.liveLuma(field, history, 1, false, false, null, gray, single);
+        for (int y = 1; y < 192; y++) for (int x = 1; x < 256; x++) {
+            int i = y*256+x;
+            // Half-pixel optical displacement and a small detail at the other sampling phase.
+            int mean = ((gray[i] & 255) + (gray[i-1] & 255) + (gray[i-256] & 255) + (gray[i-257] & 255)) / 4;
+            shifted[i] = (byte)Math.max(0, Math.min(255, mean + ((x+y)%2==0 ? 3 : -3)));
+        }
+        PixelOps.liveLuma(field, history, 1, false, true, shifted, gray, fused);
+        int refined = 0;
+        for (int i = 0; i < fused.length; i++) if (single[i] != fused[i]) refined++;
+        check(refined > 500, "Verified subpixel motion contributes detail to the 2x image");
+        Arrays.fill(shifted, (byte) 127);
+        PixelOps.liveLuma(field, history, 1, false, true, shifted, gray, fused);
+        check(Arrays.equals(single, fused), "Unregistrable exposure falls back to the current image");
+    }
+
+    private static void checkLoupe(ThermalView view, ThermalFrame frame) {
+        view.display(new ThermalCapture(frame, Calibration.DEFAULT, 2, Float.NaN, Float.NaN));
+        view.select(Measurement.Tool.POINT);
+        view.setLoupe(true);
+        Bitmap bitmap = Bitmap.createBitmap(view.getWidth(), view.getHeight(), Bitmap.Config.ARGB_8888);
+        view.draw(new android.graphics.Canvas(bitmap));
+        RectF inset = field(view, "inset", RectF.class);
+        Rect source = field(view, "insetSensor", Rect.class);
+        int px = source.left + source.width()/4, py = source.top + source.height()/3;
+        tapPreview(view, (inset.left + (px-source.left+.5f) * inset.width()/source.width()) / view.getWidth(),
+                (inset.top + (py-source.top+.5f) * inset.height()/source.height()) / view.getHeight());
+        check(view.measurement.start == Measurement.pixel(px, py) && view.spotReading() == frame.readings[py*256+px],
+                "Inset taps select the corresponding sensor pixel");
+        bitmap.recycle();
+        view.setLoupe(false);
     }
 
     private static void checkLabels(ThermalView view, ThermalFrame base, Calibration calibration) {
@@ -906,7 +1031,7 @@ public final class ThermalSmokeTest extends Instrumentation {
             check("照片已保存".equals(result.poll(10, TimeUnit.SECONDS)), "PNG published");
             Uri image = latestPhoto();
             LinkedBlockingQueue<Boolean> ready = new LinkedBlockingQueue<>();
-            media.start(ready::offer);
+            media.start(doubleReplay ? 2 : 1, ready::offer);
             check(Boolean.TRUE.equals(ready.poll(10, TimeUnit.SECONDS)), "Encoder start");
             AtomicInteger draws = new AtomicInteger();
             ThermalFrame[] previous = {null};
@@ -915,22 +1040,33 @@ public final class ThermalSmokeTest extends Instrumentation {
                 if (c != null && c.frame != previous[0]) { draws.incrementAndGet(); previous[0] = c.frame; }
             };
             runOnMainSync(() -> view.getViewTreeObserver().addOnDrawListener(listener));
-            long start = SystemClock.elapsedRealtime();
             int n = seconds * 50;
-            BlindPixels noDefects = BlindPixels.fromFactory(new byte[ThermalFrame.PIXELS * 4]);
+            File kb = new File(getTargetContext().getCacheDir(), "wp09-kb.bin");
+            BlindPixels noDefects = BlindPixels.fromFactory(recorded != null && kb.isFile()
+                    ? readFile(kb) : new byte[ThermalFrame.PIXELS * 4]);
+            byte[][] realWire = directReplay && recorded != null ? realWireFrames() : null;
+            LiveImage sequence = new LiveImage();
+            LiveImage.Settings quality = new LiveImage.Settings(1, 7, doubleReplay);
+            ShutterGate screening = new ShutterGate();
+            expectedDisplay = directReplay ? new long[n] : null;
             float[][] referencePlanes = new float[8][];
             List<ThermalCapture> batch = new ArrayList<>(8);
             java.util.concurrent.Semaphore batches = new java.util.concurrent.Semaphore(2);
             long firstNs = 0, lastNs = 0;
+            long start = SystemClock.elapsedRealtime();
             for (int i = 0; i < n; i++) {
                 long left = start + i * 20L - SystemClock.elapsedRealtime();
                 if (left > 0) SystemClock.sleep(left);
                 int j = i % 8;
                 int raw = 6000 + j * 150;
                 wire[80] = (byte) raw; wire[81] = (byte) (raw >> 8);
-                ThermalFrame f = directReplay ? decoder.decodeThermalOutput(wire, .98f, System.nanoTime(), noDefects)
+                byte[] input = realWire == null ? wire : realWire[j];
+                ThermalFrame decoded = directReplay ? decoder.decodeThermalOutput(input, .98f, System.nanoTime(), noDefects)
                         : recorded == null ? decoder.decode(wire, 0.98f)
                         : decoder.decodeSnapshot(rawDump, j, reference, 0.98f);
+                if (directReplay) check(decoded != null && !screening.suspect(decoded, input), "Valid thermal exposure");
+                ThermalFrame f = directReplay ? sequence.process(decoded, quality, .98f, BlindPixels.NONE) : decoded;
+                if (directReplay) expectedDisplay[i] = imageChecksum(f.preview);
                 if (referencePlanes[j] == null) referencePlanes[j] = f.readings;
                 expected.add(referencePlanes[j]);
                 if (i == 0) firstNs = f.capturedNanos;
@@ -968,10 +1104,30 @@ public final class ThermalSmokeTest extends Instrumentation {
             }
             int encoded = checkMovie(movie, expected);
             if (directReplay) check(encoded == n, "Every WP-09 recording frame has a matching AVC sample");
-            report.append(String.format(java.util.Locale.ROOT, "50 Hz replay: %.1f input fps, %d/%d distinct view draws, %d AVC samples. ",
+            report.append(String.format(java.util.Locale.ROOT, "%dx%d %s replay: %.2f input fps, %d/%d distinct view draws, %d AVC samples. ",
+                    doubleReplay ? 512 : 256, doubleReplay ? 384 : 192, realWire != null ? "real AD" : "fixture",
                     (n - 1) * 1e9 / span, draws.get(), n, encoded));
             checkReview(image, movie, photoFrame);
         } finally { media.destroy(); }
+    }
+
+    // Replay eight real detector planes with the captured measurement trailer.
+    // Only the 256 x 192 active part enters the mode-4 decoder.
+    private byte[][] realWireFrames() {
+        byte[][] frames = new byte[8][];
+        for (int i = 0; i < frames.length; ++i) {
+            frames[i] = reference.clone();
+            for (int y = 0; y < ThermalFrame.HEIGHT; ++y)
+                System.arraycopy(rawDump, ((i * 203 + y + 8) * 384 + 2) * 2,
+                        frames[i], y * ThermalFrame.WIDTH * 2, ThermalFrame.WIDTH * 2);
+        }
+        return frames;
+    }
+
+    private static long imageChecksum(byte[] exposure) {
+        java.util.zip.CRC32 sum = new java.util.zip.CRC32();
+        sum.update(exposure);
+        return sum.getValue();
     }
 
     private void checkRecordingButton(MainActivity activity, ThermalFrame.Decoder decoder,
@@ -1059,6 +1215,12 @@ public final class ThermalSmokeTest extends Instrumentation {
              MovieArchive.Reader reader = new MovieArchive.Reader(fd)) {
             int count = reader.size();
             check(count >= 2, "Video contains multiple measurements");
+            if (expectedDisplay != null && inputs.size() == expectedDisplay.length) {
+                android.media.MediaFormat format = mp4.getTrackFormat(0);
+                check(format.getInteger(android.media.MediaFormat.KEY_WIDTH) == (doubleReplay ? 512 : 256)
+                        && format.getInteger(android.media.MediaFormat.KEY_HEIGHT) == (doubleReplay ? 384 : 192),
+                        "Standard AVC dimensions match the chosen raster");
+            }
             int inputIndex = 0;
             for (int i = 0; i < count; i++) {
                 long pts = reader.timeUs(i);
@@ -1066,6 +1228,9 @@ public final class ThermalSmokeTest extends Instrumentation {
                         "Metadata synchronized at frame " + i + " (" + pts + ", " + mp4.getSampleTime() + ")");
                 check(reader.atTime(pts) == i, "Seek finds exact frame");
                 ThermalFrame restored = reader.frame(i).frame;
+                if (expectedDisplay != null && inputs.size() == expectedDisplay.length)
+                    check(restored.preview != null && imageChecksum(restored.preview) == expectedDisplay[i],
+                            "Playback reproduces each exposure's finished display plane");
                 while (inputIndex < inputs.size() && !Arrays.equals(restored.readings, inputs.get(inputIndex))) inputIndex++;
                 check(inputIndex++ < inputs.size(), "Every decoded video plane matches a submitted frame");
                 mp4.advance();

@@ -58,7 +58,7 @@ final class RadiometricPng {
             if (type == IHDR && length == 13) {
                 int width = in.readInt(), height = in.readInt();
                 nativeSize = (width == ThermalFrame.WIDTH || width == ThermalFrame.WIDTH - ThermalFrame.LEGACY_LEFT_MASK)
-                        && height == ThermalFrame.HEIGHT;
+                        && height == ThermalFrame.HEIGHT || width == ThermalFrame.WIDTH * 2 && height == ThermalFrame.HEIGHT * 2;
                 length -= 8;
             }
             if (type == IEND) return null;

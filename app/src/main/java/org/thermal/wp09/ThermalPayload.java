@@ -15,7 +15,7 @@ import static org.thermal.wp09.ThermalFrame.WIDTH;
 final class ThermalPayload {
     private static final int MAGIC = 0x57505431; // WPT1
     private static final int HEADER = 52;
-    private static final int MAX_RAW = HEADER + PIXELS * 5;
+    private static final int MAX_RAW = HEADER + PIXELS * 8 + 2 + BlindPixels.MAX_USER * 2;
     static final int MAX_PACKED = MAX_RAW + 1024;
     static final int SOURCE_BYTES = 24;
     static final int LEGACY_DISPLAY = -1, AUTO = 0, LOCKED = 1;
@@ -47,10 +47,11 @@ final class ThermalPayload {
         int encode(ThermalCapture capture) throws IOException {
             ThermalFrame f = capture.frame;
             buffer.clear();
-            int kind = f.hasFirmwareImage() ? 3 : f.hasPixelTemperatures() ? 2 : f.hasTemperature() ? 1 : 0;
+            int kind = f.readings != null && f.preview != null ? 3 : f.hasPixelTemperatures() ? 2 : f.hasTemperature() ? 1 : 0;
+            if (f.displayScale() == 2 || f.repairedSites.length != 0) kind = 4;
             buffer.putInt(MAGIC).putShort((short) WIDTH).putShort((short) HEIGHT);
             buffer.put((byte) kind).put((byte) capture.palette)
-                    .put((byte) (capture.calibration.applied ? 1 : 0)).put((byte) 0);
+                    .put((byte) (capture.calibration.applied ? 1 : 0)).put((byte) (kind == 4 ? f.displayScale() : 0));
             buffer.putFloat(capture.calibration.scale).putFloat(capture.calibration.offset);
             // v0.9.2/3 require finite limits on raw-only records. Keep their legacy
             // view usable; the optional container display flag records the actual lock.
@@ -67,7 +68,12 @@ final class ThermalPayload {
             }
             if (f.preview != null) {
                 buffer.put(f.preview);
-                size += PIXELS;
+                size += f.preview.length;
+            }
+            if (kind == 4) {
+                buffer.putShort((short) f.repairedSites.length);
+                for (int p : f.repairedSites) buffer.putShort((short) p);
+                size = buffer.position();
             }
             zip.reset();
             zip.setInput(buffer.array(), 0, size);
@@ -115,7 +121,9 @@ final class ThermalPayload {
         ThermalFrame.Markers markers = source == null ? null : getMarkers(source);
         if (markers != null && (kind < 2 || firstColumn != 0)) throw invalid();
         if (thermalOutput && (kind < 2 || firstColumn != 0)) throw invalid();
-        if (b.get() != 0 || kind < 0 || kind > 3 || palette < 0
+        int raster = b.get();
+        if ((kind == 4 ? !thermalOutput || (raster != 1 && raster != 2) : raster != 0)
+                || kind < 0 || kind > 4 || palette < 0
                 || palette >= ThermalCapture.STOPS.length || applied < 0 || applied > 1) throw invalid();
         float scale = b.getFloat(), offset = b.getFloat(), low = b.getFloat(), high = b.getFloat();
         int cold = b.getInt(), hot = b.getInt();
@@ -129,7 +137,8 @@ final class ThermalPayload {
                 || (kind == 1 && (!validAnchor(cold, min) || !validAnchor(hot, max)
                 || !Float.isFinite(center) || center < min || center > max))
                 || (kind == 0 && (cold != -1 || hot != -1 || !Float.isNaN(center)))
-                || b.remaining() != PIXELS * (kind == 3 ? 5 : kind == 2 ? 4 : 1)) throw invalid();
+                || (kind != 4 && b.remaining() != PIXELS * (kind == 3 ? 5 : kind == 2 ? 4 : 1))
+                || (kind == 4 && b.remaining() < PIXELS * (4 + raster * raster) + 2)) throw invalid();
         float[] readings = null;
         byte[] brightness = null;
         if (kind >= 2) {
@@ -157,11 +166,21 @@ final class ThermalPayload {
             if (display == AUTO || (display == LEGACY_DISPLAY && autoRaw)) low = high = Float.NaN;
         }
         if (kind != 2) {
-            brightness = new byte[PIXELS];
+            brightness = new byte[kind == 4 ? PIXELS * raster * raster : PIXELS];
             b.get(brightness);
         }
+        int[] sites = BlindPixels.NONE;
+        if (kind == 4) {
+            int n = Short.toUnsignedInt(b.getShort());
+            if (n > BlindPixels.MAX_USER || b.remaining() != n * 2) throw invalid();
+            sites = new int[n];
+            for (int i = 0; i < n; i++) {
+                sites[i] = Short.toUnsignedInt(b.getShort());
+                if (sites[i] >= PIXELS || (i > 0 && sites[i] <= sites[i-1])) throw invalid();
+            }
+        }
         ThermalFrame frame = new ThermalFrame(readings, brightness, cold, hot, min, max, center, average,
-                System.nanoTime(), markers, firstColumn, thermalOutput);
+                System.nanoTime(), markers, firstColumn, thermalOutput, sites, palette);
         return new ThermalCapture(frame, new Calibration(scale, offset, applied == 1), palette, low, high);
     }
 

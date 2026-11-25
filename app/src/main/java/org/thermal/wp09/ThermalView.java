@@ -20,11 +20,15 @@ import static org.thermal.wp09.ThermalFrame.*;
 final class ThermalView extends View {
     final Measurement measurement = new Measurement();
     private Bitmap bitmap = Bitmap.createBitmap(WIDTH, HEIGHT, Bitmap.Config.ARGB_8888);
-    private final int[] rendered = new int[PIXELS], lut = new int[256];
+    private int[] rendered = new int[PIXELS];
+    private final int[] lut = new int[256];
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final RectF image = new RectF(), destination = new RectF();
     private final Rect active = new Rect(0, 0, WIDTH, HEIGHT);
     private final RectF activeDestination = new RectF();
+    private final RectF inset = new RectF(), downInset = new RectF();
+    private final Rect insetSensor = new Rect(), insetSource = new Rect(), downSensor = new Rect();
+    private boolean loupe, touchInLoupe;
     private static final int COLD_COLOR = 0xffcccccc, HOT_COLOR = Color.WHITE;
     private final ExtremumLabel coldLabel = new ExtremumLabel("低", COLD_COLOR);
     private final ExtremumLabel hotLabel = new ExtremumLabel("高", HOT_COLOR);
@@ -60,6 +64,12 @@ final class ThermalView extends View {
     ThermalCapture drawnCapture() { return lastDrawn; }
     int fps() { return fps; }
 
+    void setLoupe(boolean enabled) {
+        loupe = enabled;
+        if (!enabled) inset.setEmpty();
+        invalidate();
+    }
+
     void setExtremaVisible(boolean hot, boolean cold) {
         if (hotLabel.enabled == hot && coldLabel.enabled == cold) return;
         hotLabel.enabled = hot;
@@ -69,7 +79,9 @@ final class ThermalView extends View {
 
     ThermalCapture compose(ThermalFrame frame, Calibration calibration) {
         if (frame == null) return null;
-        return new ThermalCapture(frame, calibration, palette, Float.NaN, Float.NaN, capture != null && capture.frame == frame ? capture.movieImage : null);
+        int color = frame.exposurePalette >= 0 ? frame.exposurePalette : palette;
+        return new ThermalCapture(frame, calibration, color, Float.NaN, Float.NaN,
+                capture != null && capture.frame == frame ? capture.movieImage : null);
     }
 
     void show(ThermalFrame frame, Calibration calibration, boolean enabled) {
@@ -92,10 +104,12 @@ final class ThermalView extends View {
             measurement.end = visiblePixel(measurement.end);
             if (next.palette != palette) gradient = null;
             palette = next.palette;
+            int scale = next.frame.displayScale();
+            if (rendered.length != next.rasterPixels()) rendered = new int[next.rasterPixels()];
             next.render(rendered, lut);
-            if (bitmap.getWidth() != active.width())
-                bitmap = Bitmap.createBitmap(active.width(), HEIGHT, Bitmap.Config.ARGB_8888);
-            bitmap.setPixels(rendered, active.left, WIDTH, 0, 0, active.width(), HEIGHT);
+            if (bitmap.getWidth() != active.width() * scale || bitmap.getHeight() != HEIGHT * scale)
+                bitmap = Bitmap.createBitmap(active.width() * scale, HEIGHT * scale, Bitmap.Config.ARGB_8888);
+            bitmap.setPixels(rendered, active.left * scale, WIDTH * scale, 0, 0, bitmap.getWidth(), bitmap.getHeight());
         } else {
             fpsStart = 0;
             fps = draws = 0;
@@ -171,6 +185,7 @@ final class ThermalView extends View {
             drawSelection(canvas);
             drawExtrema(canvas);
         }
+        if (loupe) drawLoupe(canvas);
         canvas.restore();
         if (degrees) drawScale(canvas);
         if (capture.frame != drawnFrame()) {
@@ -184,6 +199,52 @@ final class ThermalView extends View {
             }
         }
         lastDrawn = capture;
+    }
+
+    private void drawLoupe(Canvas canvas) {
+        int p = measurement.tool == Measurement.Tool.POINT ? measurement.start : measurement.end;
+        float w = Math.min(d(148), image.width() * .31f);
+        float margin = d(5);
+        float top = image.top + margin;
+        if (sx(p) > image.right - w - margin && sy(p) < top + .75f * w + margin)
+            top = image.bottom - margin - .75f * w;
+        inset.set(image.right - w - margin, top, image.right - margin, top + .75f * w);
+        int sw = Math.max(4, Math.round(w * WIDTH / destination.width() / 2.5f));
+        int sh = Math.max(3, Math.round(sw * .75f));
+        int x = Math.max(active.left, Math.min(WIDTH - sw, p % WIDTH - sw / 2));
+        int y = Math.max(0, Math.min(HEIGHT - sh, p / WIDTH - sh / 2));
+        insetSensor.set(x, y, x + sw, y + sh);
+        if (touchInLoupe && !multi) {
+            inset.set(downInset);
+            insetSensor.set(downSensor);
+            x = insetSensor.left;
+            y = insetSensor.top;
+            sw = insetSensor.width();
+            sh = insetSensor.height();
+        }
+        int s = capture.frame.displayScale();
+        insetSource.set((x - active.left) * s, y * s, (x - active.left + sw) * s, (y + sh) * s);
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(Color.WHITE);
+        canvas.drawBitmap(bitmap, insetSource, inset, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(d(2));
+        paint.setColor(Color.BLACK);
+        canvas.drawRect(inset, paint);
+        paint.setStrokeWidth(d(1));
+        paint.setColor(Color.WHITE);
+        canvas.drawRect(inset, paint);
+        if (measuring) {
+            float mx = inset.left + (p % WIDTH + .5f - x) * inset.width() / sw;
+            float my = inset.top + (p / WIDTH + .5f - y) * inset.height() / sh;
+            paint.setColor(Color.BLACK);
+            paint.setStrokeWidth(d(3));
+            canvas.drawRect(mx-d(3), my-d(3), mx+d(3), my+d(3), paint);
+            paint.setColor(Color.WHITE);
+            paint.setStrokeWidth(d(1));
+            canvas.drawRect(mx-d(3), my-d(3), mx+d(3), my+d(3), paint);
+        }
+        paint.setStyle(Paint.Style.FILL);
     }
 
     private void drawExtrema(Canvas canvas) {
@@ -333,6 +394,9 @@ final class ThermalView extends View {
                 if (!image.contains(x, y)) return false;
                 downX = lastX = x;
                 downY = lastY = y;
+                touchInLoupe = loupe && inset.contains(x, y);
+                downInset.set(inset);
+                downSensor.set(insetSensor);
                 multi = dragged = false;
                 dragStart = measurement.start;
                 dragEnd = measurement.end;
@@ -369,7 +433,7 @@ final class ThermalView extends View {
                     invalidate();
                 } else if (!multi) {
                     dragged |= Math.hypot(x - downX, y - downY) > slop;
-                    if (dragged && measurement.tool == Measurement.Tool.POINT && zoom > 1) {
+                    if (dragged && measurement.tool == Measurement.Tool.POINT && zoom > 1 && !touchInLoupe) {
                         float scale = destination.width() / WIDTH;
                         cx -= (x - lastX) / scale;
                         cy -= (y - lastY) / scale;
@@ -385,14 +449,16 @@ final class ThermalView extends View {
             case MotionEvent.ACTION_UP:
                 if (!multi && measuring && capture != null && capture.frame.hasTemperature()) {
                     if (measurement.tool != Measurement.Tool.POINT) setEndpoints(x, y);
-                    else if (!dragged && image.contains(x, y)) {
+                    else if ((!dragged || touchInLoupe) && image.contains(x, y)) {
                         measurement.start = measurement.end = toPixel(x, y);
                         selectionChanged();
                     }
                 }
+                touchInLoupe = false;
                 performClick();
                 return true;
             case MotionEvent.ACTION_CANCEL:
+                touchInLoupe = false;
                 multi = false;
                 return true;
             default:
@@ -411,6 +477,12 @@ final class ThermalView extends View {
     }
 
     private int toPixel(float x, float y) {
+        if (touchInLoupe) {
+            int col = downSensor.left + (int)((x - downInset.left) * downSensor.width() / downInset.width());
+            int row = downSensor.top + (int)((y - downInset.top) * downSensor.height() / downInset.height());
+            return Measurement.pixel(Math.max(downSensor.left, Math.min(downSensor.right - 1, col)),
+                    Math.max(downSensor.top, Math.min(downSensor.bottom - 1, row)));
+        }
         return visiblePixel(Measurement.pixel((int) ((x - destination.left) * WIDTH / destination.width()),
                 (int) ((y - destination.top) * HEIGHT / destination.height())));
     }

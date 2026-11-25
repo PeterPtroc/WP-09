@@ -14,6 +14,8 @@ import java.util.function.Consumer;
 
 final class CameraController {
     private final UsbManager usb;
+    private final android.content.SharedPreferences prefs;
+    private volatile LiveImage.Settings quality = new LiveImage.Settings(0, 0, false);
     private final HandlerThread thread = new HandlerThread("WP09 USB");
     private final Handler worker;
     private final HandlerThread previewThread = new HandlerThread("WP09 preview");
@@ -24,7 +26,12 @@ final class CameraController {
     private UsbSample lastFailure;
 
     CameraController(UsbManager usb) {
+        this(usb, null);
+    }
+
+    CameraController(UsbManager usb, android.content.SharedPreferences prefs) {
         this.usb = usb;
+        this.prefs = prefs;
         thread.start();
         worker = new Handler(thread.getLooper());
         previewThread.start();
@@ -43,6 +50,16 @@ final class CameraController {
 
     void setEmissivity(float value) {
         emissivity = value;
+    }
+
+    void setQuality(int scene, int palette, boolean doubleSize) {
+        if (scene != quality.scene || palette != quality.palette || doubleSize != quality.doubleSize)
+            quality = new LiveImage.Settings(scene, palette, doubleSize);
+    }
+
+    CameraRepairs repairs() {
+        Session session = current;
+        return session == null ? null : session.repairs;
     }
 
     void collectSample(Consumer<UsbSample> callback) {
@@ -157,6 +174,8 @@ final class CameraController {
         private volatile int movieGeneration;
         private final boolean xwild;
         private BlindPixels defects;
+        private volatile CameraRepairs repairs;
+        private final LiveImage image = new LiveImage();
         private boolean identifiedThermalOutput;
         private ThermalFrame recentPreview;
         private long retryPreviewAt;
@@ -210,7 +229,11 @@ final class CameraController {
                     } finally {
                         if (capture != null) capture.close();
                     }
-                    defects = BlindPixels.fromFactory(Wp09Usb.factoryKb(handle));
+                    byte[] kb = Wp09Usb.factoryKb(handle);
+                    defects = BlindPixels.fromFactory(kb);
+                    String serial = null;
+                    try { serial = device.getSerialNumber(); } catch (SecurityException ignored) {}
+                    repairs = new CameraRepairs(prefs, serial, kb, defects);
                 }
                 lastReceived = SystemClock.elapsedRealtime();
                 previewWorker.post(this::poll);
@@ -238,6 +261,7 @@ final class CameraController {
         }
 
         private void beginShutter(long stamp, boolean commanded) {
+            image.reset();
             shutter.start(stamp, commanded);
             selectPreview(stamp);
         }
@@ -252,7 +276,8 @@ final class CameraController {
         private ThermalFrame thermalFrame(ThermalFrame.Decoder reader, byte[] wire, float emiss, long stamp) {
             if (identifiedThermalOutput && !shutter.holding()) {
                 ThermalFrame frame = reader.decodeThermalOutput(wire, emiss, stamp, defects);
-                if (frame == null || !shutter.suspect(frame, wire)) return frame;
+                if (frame == null) return null;
+                if (!shutter.suspect(frame, wire)) return finishImage(reader, wire, frame, emiss);
                 beginShutter(stamp, false);
                 return null;
             }
@@ -281,7 +306,13 @@ final class CameraController {
                 shutterSettled = null;
                 main.post(() -> { if (current == this) done.accept(true); });
             }
-            return first;
+            return finishImage(reader, wire, first, emiss);
+        }
+
+        private ThermalFrame finishImage(ThermalFrame.Decoder reader, byte[] wire, ThermalFrame verified, float emiss) {
+            CameraRepairs.Map map = repairs.current;
+            ThermalFrame measured = map.correction == null ? verified : reader.repair(wire, verified, map.correction);
+            return measured == null ? null : image.process(measured, quality, emiss, map.sites);
         }
 
         private ThermalFrame liveFrame(long stamp) {

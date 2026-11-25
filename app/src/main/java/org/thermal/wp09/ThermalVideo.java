@@ -36,23 +36,29 @@ final class ThermalVideo implements Closeable {
     private final Map<Long, PendingFrame> pending = new LinkedHashMap<>();
     private final ArrayList<PendingFrame> warmup = new ArrayList<>(MobileImage.WINDOW);
     private MobileImage movieImage;
-    private final int[] pixels = new int[PIXELS], lut = new int[256];
+    private final int[] pixels, lut = new int[256];
     private int track = -1;
     private long originNs = -1, lastInput = -1, firstOutput = -1, lastOutput = -1;
     private long firstEventNs, lastEventNs;
     private boolean eos;
 
     ThermalVideo(File directory, boolean fullMaps) throws IOException {
+        this(directory, fullMaps, 1);
+    }
+
+    ThermalVideo(File directory, boolean fullMaps, int scale) throws IOException {
+        if (scale != 1 && scale != 2) throw new IOException("Unsupported image size");
+        pixels = new int[PIXELS * scale * scale];
         video = File.createTempFile("wp09-video-", ".mp4", directory);
         try {
             archive = new MovieArchive.Writer(directory);
             muxer = new MediaMuxer(video.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT);
+            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH * scale, HEIGHT * scale);
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
             // Give full maps sufficient bits for fine temperature gradients.
             codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
             int bitRate = codec.getCodecInfo().getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                    .getVideoCapabilities().getBitrateRange().clamp(fullMaps ? 6_000_000 : 2_000_000);
+                    .getVideoCapabilities().getBitrateRange().clamp(fullMaps ? 6_000_000 * scale : 2_000_000);
             format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate);
             format.setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT601_NTSC);
             format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED);
@@ -126,7 +132,7 @@ final class ThermalVideo implements Closeable {
         pending.put(pts, new PendingFrame(frame, timeNs));
         lastEventNs = timeNs;
         lastInput = pts;
-        codec.queueInputBuffer(slot, 0, PIXELS * 3 / 2, pts, 0);
+        codec.queueInputBuffer(slot, 0, pixels.length * 3 / 2, pts, 0);
         drain(0);
     }
 

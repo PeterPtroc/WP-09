@@ -68,9 +68,13 @@ final class ThermalMedia {
     }
 
     void start(Consumer<Boolean> ready) {
+        start(1, ready);
+    }
+
+    void start(int scale, Consumer<Boolean> ready) {
         worker.post(() -> {
             try {
-                movie = new ThermalVideo(context.getCacheDir(), true);
+                movie = new ThermalVideo(context.getCacheDir(), true, scale);
                 main.post(() -> ready.accept(true));
             } catch (IOException | RuntimeException e) {
                 Log.w("WP09", "Video start", e);

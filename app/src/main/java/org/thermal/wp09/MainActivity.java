@@ -74,6 +74,8 @@ public final class MainActivity extends AppCompatActivity {
     private boolean recordingStarting;
     private int recordingRequest;
     private int palette;
+    private int scene;
+    private boolean doubleSize, repairPicking;
     private float emissivity;
     private ThermalFrame frame;
     private ThermalFrame liveFrame;
@@ -129,9 +131,12 @@ public final class MainActivity extends AppCompatActivity {
         settings = getSharedPreferences("wp09", MODE_PRIVATE);
         calibration = new Calibration(settings.getFloat("scale", 1), settings.getFloat("offset", 0),
                 settings.getBoolean("calibrated", false));
-        palette = settings.getInt("palette", 0);
+        palette = Math.max(0, Math.min(ThermalCapture.PALETTE_NAMES.length - 1, settings.getInt("palette", 0)));
+        scene = Math.max(0, Math.min(LiveImage.SCENES.length - 1, settings.getInt("scene", 0)));
+        doubleSize = settings.getBoolean("doubleSize", false);
         emissivity = settings.getFloat("emissivity", 0.98f);
-        camera = new CameraController(usb);
+        camera = new CameraController(usb, settings);
+        camera.setQuality(scene, palette, doubleSize);
         camera.setEmissivity(emissivity);
         media = new ThermalMedia(this, this::message);
         alarms.low = settings.getFloat("alarmLow", Float.NaN);
@@ -212,7 +217,9 @@ public final class MainActivity extends AppCompatActivity {
                 render();
             }
         });
-        shutterButton = action(rangeRow, "快门校准", R.drawable.ic_crosshair, this::triggerShutter);
+        shutterButton = action(rangeRow, "快门校准", R.drawable.ic_crosshair, () -> {
+            if (repairPicking) editRepair(); else triggerShutter();
+        });
         LinearLayout options = row(this);
         panel.addView(options);
         laserButton = action(options, "开启激光", R.drawable.ic_zap, this::toggleLaser);
@@ -224,7 +231,7 @@ public final class MainActivity extends AppCompatActivity {
         String[] entries = {"色彩　" + ThermalCapture.PALETTE_NAMES[palette], "高低温提醒",
                 "发射率　" + emissivity, Float.isFinite(lowCalibrationReading) ? "校准高点" : "参考温度校准",
                 measuring ? "隐藏测量标记" : "显示测量标记",
-                "复位画面"};
+                "复位画面", "画质　" + LiveImage.SCENES[scene] + (doubleSize ? " · 2×" : ""), "坏点修正"};
         dialog().setTitle("设置").setItems(entries, (d, i) -> {
             switch (i) {
                 case 0: choosePalette(); break;
@@ -234,8 +241,82 @@ public final class MainActivity extends AppCompatActivity {
                         else message("等待测温数据"); break;
                 case 4: measuring = !measuring; render(); break;
                 case 5: thermal.resetViewport(); break;
+                case 6: chooseQuality(); break;
+                case 7: selectRepair(); break;
             }
         }).show();
+    }
+
+    private void chooseQuality() {
+        LinearLayout choices = new LinearLayout(this);
+        choices.setOrientation(LinearLayout.VERTICAL);
+        choices.setPadding(dp(20), 0, dp(20), 0);
+        android.widget.RadioGroup group = new android.widget.RadioGroup(this);
+        group.setOrientation(LinearLayout.HORIZONTAL);
+        for (String name : LiveImage.SCENES) {
+            android.widget.RadioButton button = new android.widget.RadioButton(this);
+            button.setId(View.generateViewId());
+            button.setText(name);
+            group.addView(button);
+        }
+        group.check(group.getChildAt(scene).getId());
+        choices.addView(group);
+        android.widget.CheckBox doubled = new android.widget.CheckBox(this);
+        doubled.setText("2× 增强成像");
+        doubled.setChecked(doubleSize);
+        doubled.setEnabled(!recording && !recordingStarting);
+        choices.addView(doubled);
+        dialog().setTitle("画质").setView(choices).setNegativeButton("取消", null)
+                .setPositiveButton("确定", (d, w) -> {
+                    scene = group.indexOfChild(group.findViewById(group.getCheckedRadioButtonId()));
+                    if (!recording && !recordingStarting) doubleSize = doubled.isChecked();
+                    settings.edit().putInt("scene", scene).putBoolean("doubleSize", doubleSize).apply();
+                    applyQuality();
+                }).show();
+    }
+
+    private void applyQuality() {
+        camera.setQuality(scene, palette, doubleSize);
+        if (paused && frame != null && frame.thermalOutput) {
+            frame = new LiveImage().process(frame, new LiveImage.Settings(scene, palette, doubleSize),
+                    emissivity, frame.repairedSites);
+        }
+        render();
+    }
+
+    private void selectRepair() {
+        CameraRepairs repairs = camera.repairs();
+        if (recording || recordingStarting) { message("请先停止录像"); return; }
+        if (repairs == null || !repairs.editable() || thermal.drawnFrame() == null || !thermal.drawnFrame().thermalOutput) {
+            message("请连接可识别的 WP-09"); return;
+        }
+        if (paused && thermal.measurement.tool == Measurement.Tool.POINT) { editRepair(); return; }
+        frame = thermal.drawnFrame();
+        repairPicking = paused = measuring = true;
+        thermal.select(Measurement.Tool.POINT);
+        inspection.reset();
+        render();
+    }
+
+    private void editRepair() {
+        CameraRepairs repairs = camera.repairs();
+        if (repairs == null || !paused) return;
+        int p = thermal.measurement.start;
+        boolean existing = java.util.Arrays.binarySearch(repairs.current.sites, p) >= 0;
+        boolean factory = repairs.factory != null && repairs.factory.contains(p);
+        AlertDialog.Builder edit = dialog().setTitle("坏点修正").setMessage(
+                (factory ? "出厂已修正　" : "") + "(" + p % ThermalFrame.WIDTH + ", " + p / ThermalFrame.WIDTH + ")")
+                .setNegativeButton("取消", null);
+        if (!factory) edit.setPositiveButton(existing ? "恢复此点" : "修正此点", (d, w) -> {
+            if (repairs != camera.repairs()) return;
+            if (repairs.change(p, false)) resumePreview(); else message("手动修正已达上限");
+        });
+        if (repairs.current.sites.length > 0) edit.setNeutralButton("清除手动修正", (d, w) ->
+                dialog().setTitle("清除本机全部手动修正？").setNegativeButton("取消", null)
+                        .setPositiveButton("清除", (confirm, which) -> {
+                            if (repairs == camera.repairs() && repairs.change(p, true)) resumePreview();
+                        }).show());
+        edit.show();
     }
 
     private void triggerShutter() {
@@ -373,6 +454,7 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void disconnect() {
+        repairPicking = false;
         camera.stop();
         stopVideo();
         status.setText("等待 USB");
@@ -392,6 +474,7 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void resumePreview() {
+        repairPicking = false;
         paused = false;
         frame = liveFrame;
         inspection.reset();
@@ -491,7 +574,7 @@ public final class MainActivity extends AppCompatActivity {
         mapRate = "";
         recordingStarting = true;
         int request = ++recordingRequest;
-        media.start(ok -> {
+        media.start(pullingVideoMaps ? (doubleSize ? 2 : 1) : frame.displayScale(), ok -> {
             if (request != recordingRequest) return;
             recordingStarting = false;
             recording = ok;
@@ -575,7 +658,7 @@ public final class MainActivity extends AppCompatActivity {
                     palette = which;
                     thermal.setPalette(which);
                     settings.edit().putInt("palette", which).apply();
-                    render();
+                    applyQuality();
                     dialog.dismiss();
                 }).setNegativeButton("取消", null).show();
     }
@@ -696,6 +779,7 @@ public final class MainActivity extends AppCompatActivity {
             String state;
             if (shutterBusy) state = recording ? "录像 · 快门校准中" : "快门校准中";
             else if (recording) state = mapRate.isEmpty() ? "正在录像" : "录像 · " + mapRate;
+            else if (repairPicking) state = "点选坏点";
             else if (paused) state = "已定格";
             else state = frame != null && frame.hasTemperature() ? "实时预览" : "无温度数据";
             label(status, state);
@@ -716,6 +800,9 @@ public final class MainActivity extends AppCompatActivity {
         pauseButton.setSelected(paused);
         label(pauseButton, paused ? "实时" : "定格");
         shutterButton.setEnabled(streaming && mapAvailable && !shutterBusy);
+        label(shutterButton, repairPicking ? "修正选点" : "快门校准");
+        if (Build.VERSION.SDK_INT >= 26 && !shutterButton.getText().equals(shutterButton.getTooltipText()))
+            shutterButton.setTooltipText(shutterButton.getText());
         laserButton.setEnabled(streaming && !laserBusy);
         if (laserButton.isSelected() != laser) {
             laserButton.setSelected(laser);

@@ -19,10 +19,11 @@ final class InspectionPanel extends LinearLayout {
     private final TemperaturePlot plot;
     private final MaterialButton chart;
     private final MaterialButton hotMarker, coldMarker;
+    private final MaterialButton loupe;
     private final SharedPreferences settings;
     private static final String SHOW_HOT = "showHotMarker", SHOW_COLD = "showColdMarker";
     private final SharedPreferences.OnSharedPreferenceChangeListener markerChange = (prefs, key) -> {
-        if (SHOW_HOT.equals(key) || SHOW_COLD.equals(key) || key == null) loadMarkers();
+        if (SHOW_HOT.equals(key) || SHOW_COLD.equals(key) || "loupe".equals(key) || key == null) loadMarkers();
     };
     private long time;
     private boolean hasTime;
@@ -41,6 +42,14 @@ final class InspectionPanel extends LinearLayout {
         value.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         reading.addView(name);
         reading.addView(value, new LayoutParams(0, -2, 1));
+        loupe = action(reading, "", R.drawable.ic_loupe, () ->
+                settings.edit().putBoolean("loupe", !settings.getBoolean("loupe", false)).apply());
+        LayoutParams lp = (LayoutParams) loupe.getLayoutParams();
+        lp.width = dp(c, 42);
+        lp.weight = 0;
+        loupe.setLayoutParams(lp);
+        loupe.setContentDescription("局部放大");
+        if (android.os.Build.VERSION.SDK_INT >= 26) loupe.setTooltipText("局部放大");
         addView(reading);
         LinearLayout markers = row(c);
         addView(markers);
@@ -103,6 +112,9 @@ final class InspectionPanel extends LinearLayout {
         hotMarker.setSelected(hot);
         coldMarker.setSelected(cold);
         thermal.setExtremaVisible(hot, cold);
+        boolean magnify = settings.getBoolean("loupe", false);
+        loupe.setSelected(magnify);
+        thermal.setLoupe(magnify);
         refresh(time, false);
     }
 
@@ -128,7 +140,7 @@ final class InspectionPanel extends LinearLayout {
         Measurement m = thermal.measurement;
         m.evaluate(c == null ? null : c.frame, c == null ? Calibration.DEFAULT : c.calibration);
         boolean point = m.tool == Measurement.Tool.POINT;
-        boolean estimated = c != null && !c.frame.thermalOutput && c.frame.hasTemperature();
+        boolean estimated = m.includesRepair || c != null && !c.frame.thermalOutput && c.frame.hasTemperature();
         boolean centerPair = point && c != null && !c.frame.hasPixelTemperatures() && m.start == ThermalFrame.CENTER
                 && m.start != c.frame.hot && m.start != c.frame.cold;
         label(name, point ? (centerPair ? "中心温度" : "选点") : m.tool == Measurement.Tool.LINE ? "线均温" : "区域均温");

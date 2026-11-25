@@ -27,6 +27,8 @@ final class ThermalFrame {
     final Markers firmware;
     final boolean thermalOutput;
     final Markers reported;
+    final int[] repairedSites;
+    final int exposurePalette;
 
     static final class Markers {
         final int cold, hot;
@@ -58,6 +60,15 @@ final class ThermalFrame {
 
     ThermalFrame(float[] readings, byte[] preview, int cold, int hot, float minimum, float maximum,
                  float center, float average, long capturedNanos, Markers firmware, int firstColumn, boolean thermalOutput) {
+        this(readings, preview, cold, hot, minimum, maximum, center, average, capturedNanos,
+                firmware, firstColumn, thermalOutput, BlindPixels.NONE, -1);
+    }
+
+    ThermalFrame(float[] readings, byte[] preview, int cold, int hot, float minimum, float maximum,
+                 float center, float average, long capturedNanos, Markers firmware, int firstColumn,
+                 boolean thermalOutput, int[] repairedSites, int exposurePalette) {
+        this.repairedSites = repairedSites;
+        this.exposurePalette = exposurePalette;
         this.capturedNanos = capturedNanos;
         this.firstColumn = firstColumn;
         this.firmware = firmware;
@@ -83,11 +94,14 @@ final class ThermalFrame {
     }
 
     boolean hasFirmwareImage() {
-        return preview != null && readings != null;
+        return !thermalOutput && preview != null && readings != null;
     }
 
+    int displayScale() { return preview != null && preview.length == PIXELS * 4 ? 2 : 1; }
+
     boolean isEstimatedAt(int pixel) {
-        if (!measurable(pixel) || thermalOutput) return false;
+        if (!measurable(pixel)) return false;
+        if (thermalOutput) return java.util.Arrays.binarySearch(repairedSites, pixel) >= 0;
         if (readings != null) return firmware == null || (pixel != firmware.hot && pixel != firmware.cold);
         return pixel != CENTER && pixel != cold && pixel != hot;
     }
@@ -229,6 +243,11 @@ final class ThermalFrame {
                     && word(frame, result.hot * 2) == word(frame, TELEMETRY + 8)
                     && word(frame, result.cold * 2) == word(frame, TELEMETRY + 14)
                     && ((word(frame, CENTER * 2) + word(frame, (CENTER - 1) * 2)) >> 1) == word(frame, TELEMETRY + 24);
+        }
+
+        ThermalFrame repair(byte[] wire, ThermalFrame verified, BlindPixels defects) {
+            defects.correct(ByteBuffer.wrap(wire).order(ByteOrder.LITTLE_ENDIAN));
+            return convert(wire, 0, WIDTH * Short.BYTES, true, verified.capturedNanos);
         }
 
         private Markers markers(ByteBuffer frame) {

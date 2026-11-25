@@ -15,7 +15,9 @@ using Signature = std::array<float, tilesX * tilesY>;
 // Prefix sums over finite, active pixels keep all window sizes linear in image size.
 // Thread-local scratch is shared between successive frames, never between viewer and encoder.
 struct Workspace {
-    Plane field{}, smooth{};
+    Plane field{}, smooth{}, history{};
+    std::array<uint8_t, pixels> gray{}, previous{};
+    std::vector<uint8_t> enlarged;
     std::array<double, prefixSize> sums{};
     std::array<int, prefixSize> counts{};
     std::array<jint, pixels> colors{};
@@ -232,8 +234,18 @@ void correctRows(int left, float sigma) {
     }
 }
 
-void render(int left, const jint* lut, bool thermalOutput) {
-    float sigma = ws.noise(left);
+// Phone-side tuning of the radiometric channel. Independent flat/texture gains
+// avoid turning smooth backgrounds into grain when enhancing small details.
+struct Tuning {
+    float temporal, flat, texture, sharpness, contrast, trim, shadow;
+};
+constexpr Tuning profiles[][2] = {
+    {{.66f,.30f,1.f,.48f,.98f,.010f,0.f}, {.64f,.25f,.94f,.42f,.95f,.009f,.10f}},
+    {{.57f,.22f,1.10f,.85f,.91f,.006f,.06f}, {.56f,.20f,1.04f,.75f,.90f,.006f,.14f}},
+    {{.38f,.18f,1.25f,1.05f,1.06f,.003f,.04f}, {.36f,.16f,1.17f,.97f,1.02f,.003f,.11f}},
+};
+
+void render(int left, const jint* lut, bool thermalOutput, float sigma, const Tuning* profile = nullptr) {
     if (thermalOutput) correctRows(left, sigma);
     ws.index(ws.field, left);
     float preserve = .18f / (.18f + sigma);
@@ -253,7 +265,9 @@ void render(int left, const jint* lut, bool thermalOutput) {
             float signal = center - near;
             float pixelWeight = signal * signal / (signal * signal + 9 * noise * noise);
             float edgeWeight = edge / (edge + noise);
-            filtered = far + (.30f + .70f * edgeWeight) * (near - far) + pixelWeight * signal;
+            float flat = profile ? profile->flat : .30f;
+            float texture = profile ? profile->texture : 1.f;
+            filtered = far + (flat + (1.f - flat) * edgeWeight) * (near - far) + texture * pixelWeight * signal;
         }
         ws.smooth[i] = filtered;
         if (y % 3 == 0 && (x + y / 3) % 4 == 0) ws.sample.push_back(filtered);
@@ -262,9 +276,10 @@ void render(int left, const jint* lut, bool thermalOutput) {
         for (int y = 0; y < height; ++y) for (int x = left; x < width; ++x)
             if (std::isfinite(ws.smooth[y * width + x])) ws.sample.push_back(ws.smooth[y * width + x]);
     }
-    std::fill(ws.colors.begin(), ws.colors.end(), static_cast<jint>(0xff000000u));
+    if (lut) std::fill(ws.colors.begin(), ws.colors.end(), static_cast<jint>(0xff000000u));
+    else ws.gray.fill(0);
     if (ws.sample.empty()) return;
-    int trim = static_cast<int>(ws.sample.size() / 100);
+    int trim = profile ? static_cast<int>(ws.sample.size() * profile->trim) : static_cast<int>(ws.sample.size() / 100);
     float low = ws.quantile(trim), high = ws.quantile(static_cast<int>(ws.sample.size()) - 1 - trim);
     float minSpan = thermalOutput ? std::max(1.f, 20 * sigma) : 1.f;
     float span = std::max(high - low, minSpan), mid = (low + high) * .5f;
@@ -274,8 +289,12 @@ void render(int left, const jint* lut, bool thermalOutput) {
         float v = ws.smooth[i];
         if (!std::isfinite(v)) continue;
         float detail = std::clamp(v - ws.around(x, y, 9), -.15f * span, .15f * span);
-        float shade = std::clamp(.5f + (v - mid + .5f * detail) / span, 0.f, 1.f);
-        ws.colors[i] = lut[static_cast<int>(shade * 255 + .5f)];
+        float signal = profile ? profile->contrast * (v - mid + profile->sharpness * detail) : v - mid + .5f * detail;
+        float shade = std::clamp(.5f + signal / span, 0.f, 1.f);
+        if (profile) shade += profile->shadow * shade * (1.f - shade);
+        int level = static_cast<int>(shade * 255 + .5f);
+        if (lut) ws.colors[i] = lut[level];
+        else ws.gray[i] = static_cast<uint8_t>(level);
     }
 }
 } // namespace
@@ -335,6 +354,147 @@ Java_org_thermal_wp09_PixelOps_renderMobile(JNIEnv* env, jclass, jfloatArray rea
         for (int i = 0; i < pixels; ++i) ws.field[i] -= ws.smooth[i];
     }
     if (env->ExceptionCheck()) return;
-    render(left, lut.data(), thermalOutput);
+    render(left, lut.data(), thermalOutput, ws.noise(left));
     env->SetIntArrayRegion(output, 0, pixels, ws.colors.data());
+}
+
+namespace {
+using Gray = std::array<uint8_t, pixels>;
+
+float sampleAt(const Gray& plane, int i, float dx, float dy) {
+    int right = dx < 0 ? -1 : 1, down = dy < 0 ? -width : width;
+    float u = std::abs(dx), v = std::abs(dy);
+    return (1 - v) * ((1 - u) * plane[i] + u * plane[i + right])
+             + v * ((1 - u) * plane[i + down] + u * plane[i + down + right]);
+}
+
+// Estimate only small, well-constrained translations. An aperture, a scene cut
+// or a large motion falls back to the current exposure's edge-directed image.
+bool registerPrevious(float& dx, float& dy) {
+    double xx = 0, xy = 0, yy = 0, xt = 0, yt = 0, error = 0;
+    int used = 0;
+    for (int y = 3; y < height - 3; y += 4) for (int x = 3; x < width - 3; x += 4) {
+        int i = y * width + x;
+        float gx = .5f * (ws.previous[i+1] - ws.previous[i-1]);
+        float gy = .5f * (ws.previous[i+width] - ws.previous[i-width]);
+        float dt = ws.gray[i] - ws.previous[i];
+        if (std::abs(dt) > 32) continue;
+        xx += gx * gx; xy += gx * gy; yy += gy * gy;
+        xt += gx * dt; yt += gy * dt; error += dt * dt; ++used;
+    }
+    double det = xx * yy - xy * xy;
+    if (used < 1400 || error < used || det < .012 * (xx + yy) * (xx + yy) || det < 1) return false;
+    dx = static_cast<float>((yy * xt - xy * yt) / det);
+    dy = static_cast<float>((xx * yt - xy * xt) / det);
+    float motion = std::max(std::abs(dx), std::abs(dy));
+    if (motion < .13f || motion > .88f) return false;
+    double after = 0;
+    for (int y = 3; y < height - 3; y += 4) for (int x = 3; x < width - 3; x += 4) {
+        int i = y * width + x;
+        if (std::abs(ws.gray[i] - ws.previous[i]) > 32) continue;
+        float d = ws.gray[i] - sampleAt(ws.previous, i, dx, dy);
+        after += d * d;
+    }
+    return after < error * .70;
+}
+
+// Two output samples between adjacent detector centers are at 1/4 and 3/4.
+// Compute all four subpixels of a cell together, sharing its diagonal and gains.
+void enlargeCurrent() {
+    constexpr int stride = width * 2;
+    ws.enlarged.resize(pixels * 4);
+    for (int y = 0; y < height - 1; ++y) {
+        auto* top = ws.enlarged.data() + (2*y + 1) * stride + 1;
+        auto* bottom = top + stride;
+        const uint8_t* upper = ws.gray.data() + y * width;
+        const uint8_t* lower = upper + width;
+        for (int x = 0; x < width - 1; ++x) {
+            int a = upper[x], b = upper[x+1], c = lower[x], d = lower[x+1];
+            int ad = std::abs(a-d), bc = std::abs(b-c);
+            // The sum of bilinear interpolation and a weighted diagonal
+            // correction is a convex blend of linear and triangular estimates.
+            int gain = (a-b-c+d) * std::min(24, std::abs(ad-bc));
+            int corners = ad < bc ? 3*gain : -gain;
+            int sides = ad < bc ? gain : -3*gain;
+            int leftTop = 3*a + b, rightTop = a + 3*b;
+            int leftBottom = 3*c + d, rightBottom = c + 3*d;
+            top[2*x] = ((3*leftTop+leftBottom)*24 + corners + 192) / 384;
+            top[2*x+1] = ((3*rightTop+rightBottom)*24 + sides + 192) / 384;
+            bottom[2*x] = ((leftTop+3*leftBottom)*24 + sides + 192) / 384;
+            bottom[2*x+1] = ((rightTop+3*rightBottom)*24 + corners + 192) / 384;
+        }
+        for (int col : {0, width-1}) {
+            int a = upper[col], b = lower[col], out = col == 0 ? -1 : stride-2;
+            top[out] = (3*a+b+2)/4;
+            bottom[out] = (a+3*b+2)/4;
+        }
+    }
+    for (int y : {0, height-1}) {
+        auto* row = ws.enlarged.data() + (y == 0 ? 0 : 2*height-1)*stride;
+        const uint8_t* source = ws.gray.data() + y*width;
+        for (int x = 0; x < width-1; ++x) {
+            row[2*x+1] = (3*source[x]+source[x+1]+2)/4;
+            row[2*x+2] = (source[x]+3*source[x+1]+2)/4;
+        }
+        row[0] = source[0];
+        row[stride-1] = source[width-1];
+    }
+}
+
+void reconstruct(bool paired) {
+    enlargeCurrent();
+    float dx = 0, dy = 0;
+    if (!paired || !registerPrevious(dx, dy)) return;
+    ws.smooth.fill(0);
+    for (int y = 1; y < height-1; ++y) for (int x = 1; x < width-1; ++x) {
+        int i = y*width+x;
+        float error = ws.previous[i] - sampleAt(ws.gray, i, -dx, -dy);
+        // Occlusions and locally moving features must not teach a false detail.
+        if (std::abs(error) < 18) ws.smooth[i] = error * (1.f - std::abs(error)/18.f);
+    }
+    std::array<int, 2*width> col{};
+    std::array<float, 2*width> weight{};
+    for (int x = 0; x < width*2; ++x) {
+        float pos = .5f*x - .25f + dx;
+        col[x] = std::clamp(static_cast<int>(pos+.5f), 0, width-1);
+        weight[x] = 1.f - std::abs(pos-col[x]);
+    }
+    for (int y = 0; y < height*2; ++y) {
+        float pos = .5f*y - .25f + dy;
+        int py = std::clamp(static_cast<int>(pos+.5f), 0, height-1);
+        const float* residual = ws.smooth.data()+py*width;
+        float wy = 1.f - std::abs(pos-py);
+        auto* out = ws.enlarged.data()+y*2*width;
+        for (int x = 0; x < width*2; ++x) {
+            float value = out[x] + residual[col[x]]*wy*weight[x];
+            out[x] = static_cast<uint8_t>(static_cast<int>(std::clamp(value, 0.f, 255.f)+.5f));
+        }
+    }
+}
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_thermal_wp09_PixelOps_liveLuma(JNIEnv* env, jclass, jfloatArray readings, jfloatArray history,
+        jint scene, jboolean black, jboolean continuous, jbyteArray previous, jbyteArray low, jbyteArray high) {
+    const Tuning& profile = profiles[std::clamp(scene, 0, 2)][black ? 1 : 0];
+    env->GetFloatArrayRegion(readings, 0, pixels, ws.field.data());
+    float sigma = ws.noise(0);
+    if (continuous) {
+        env->GetFloatArrayRegion(history, 0, pixels, ws.history.data());
+        float threshold = std::max(.05f, sigma * 4.f);
+        for (int i = 0; i < pixels; ++i) {
+            float delta = ws.history[i] - ws.field[i];
+            float t = delta / threshold;
+            float agreement = std::max(0.f, 1.f - t*t);
+            ws.field[i] += delta * profile.temporal * agreement * agreement;
+        }
+    }
+    env->SetFloatArrayRegion(history, 0, pixels, ws.field.data());
+    render(0, nullptr, true, sigma, &profile);
+    if (high && continuous) env->GetByteArrayRegion(previous, 0, pixels, reinterpret_cast<jbyte*>(ws.previous.data()));
+    env->SetByteArrayRegion(low, 0, pixels, reinterpret_cast<const jbyte*>(ws.gray.data()));
+    if (high) {
+        reconstruct(continuous);
+        env->SetByteArrayRegion(high, 0, pixels * 4, reinterpret_cast<const jbyte*>(ws.enlarged.data()));
+    }
 }

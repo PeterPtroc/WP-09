@@ -135,6 +135,7 @@ Java_org_thermal_wp09_PixelOps_unpack(JNIEnv* env, jclass, jbyteArray source, jb
 extern "C" JNIEXPORT void JNICALL
 Java_org_thermal_wp09_PixelOps_renderTemperatures(JNIEnv* env, jclass, jfloatArray readings,
         jintArray palette, jintArray output, jfloat slope, jfloat offset, jfloat low, jfloat high) {
+    bool doubled = env->GetArrayLength(output) == 4 * pixels;
     Elements<float> src(env, readings);
     Elements<uint32_t> lut(env, palette);
     Elements<uint32_t> dest(env, output, true);
@@ -144,17 +145,26 @@ Java_org_thermal_wp09_PixelOps_renderTemperatures(JNIEnv* env, jclass, jfloatArr
         float v = src.ptr[i];
         float shade = ((slope * v + offset) - low) * factor;
         int index = high == low ? 127 : static_cast<int>(std::min(255.f, std::max(0.f, shade)) + 0.5f);
-        dest.ptr[i] = std::isfinite(v) ? lut.ptr[index] : 0xff000000;
+        uint32_t color = std::isfinite(v) ? lut.ptr[index] : 0xff000000;
+        if (doubled) {
+            int p = i / width * 4 * width + i % width * 2;
+            dest.ptr[p] = dest.ptr[p+1] = dest.ptr[p+2*width] = dest.ptr[p+2*width+1] = color;
+        } else dest.ptr[i] = color;
     }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_thermal_wp09_PixelOps_renderBrightness(JNIEnv* env, jclass, jbyteArray brightness,
                                                jintArray palette, jintArray output, jint firstColumn, jint sourceShift) {
+    int count = env->GetArrayLength(brightness);
     Elements<uint8_t> src(env, brightness);
     Elements<uint32_t> lut(env, palette);
     Elements<uint32_t> dest(env, output, true);
     if (!src.ptr || !lut.ptr || !dest.ptr) return;
+    if (!firstColumn && !sourceShift) {
+        for (int i = 0; i < count; ++i) dest.ptr[i] = lut.ptr[src.ptr[i]];
+        return;
+    }
     for (int y = 0; y < height; y++) {
         int row = y * width;
         std::fill_n(dest.ptr + row, firstColumn, 0xff000000u);
@@ -167,6 +177,9 @@ Java_org_thermal_wp09_PixelOps_yuv(JNIEnv* env, jclass, jintArray pixelsIn,
         jobject yBuffer, jint yOffset, jint yStride, jint yStep,
         jobject uBuffer, jint uOffset, jint uStride, jint uStep,
         jobject vBuffer, jint vOffset, jint vStride, jint vStep) {
+    int count = env->GetArrayLength(pixelsIn);
+    if (count != pixels && count != pixels * 4) return false;
+    int width = count == pixels ? 256 : 512, height = count / width;
     Plane l = plane(env, yBuffer, yOffset, yStride, yStep, width, height);
     Plane u = plane(env, uBuffer, uOffset, uStride, uStep, width / 2, height / 2);
     Plane v = plane(env, vBuffer, vOffset, vStride, vStep, width / 2, height / 2);

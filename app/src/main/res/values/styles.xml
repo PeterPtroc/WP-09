@@ -2,8 +2,16 @@
     <style name="Theme.Wp09" parent="Theme.Material3.Dark.NoActionBar">
         <item name="colorPrimary">#DEDEDE</item>
         <item name="colorOnPrimary">#151515</item>
+        <item name="colorSecondary">#CCCCCC</item>
+        <item name="colorTertiary">#BBBBBB</item>
+        <item name="colorControlActivated">#DEDEDE</item>
+        <item name="colorControlHighlight">#33FFFFFF</item>
+        <item name="colorError">#EEEEEE</item>
+        <item name="colorOnError">#151515</item>
         <item name="colorSurface">#151515</item>
         <item name="colorOnSurface">#EEEEEE</item>
+        <item name="colorOnSurfaceVariant">#BBBBBB</item>
+        <item name="colorOutline">#888888</item>
         <item name="colorSecondaryContainer">#333333</item>
         <item name="colorOnSecondaryContainer">#EEEEEE</item>
         <item name="android:windowLightStatusBar">false</item>

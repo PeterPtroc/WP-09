@@ -34,6 +34,10 @@ final class UsbSample {
         return frame != null;
     }
 
+    void setCaptureReader(boolean queued) {
+        info.setProperty("capture.hid_reader", queued ? "queued" : "sequential");
+    }
+
     void write(OutputStream stream) throws IOException {
         try (ZipOutputStream zip = new ZipOutputStream(stream)) {
             zip.putNextEntry(new ZipEntry("usb.properties"));

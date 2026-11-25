@@ -3,9 +3,13 @@
 #include <unistd.h>
 
 #include "thermal_dump.h"
+#include "queued_hid.h"
+#include "capture_preview.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -22,6 +26,8 @@ constexpr int tableSize = 16384;
 constexpr int laserOff = 0x8085;
 constexpr int laserOn = 0x8086;
 constexpr uint16_t captureRawFrames = 0x802f;
+constexpr uint16_t outputThermal = 0x8004, outputPreview = 0x8005;
+constexpr uint16_t forceDynamicCalibration = 0x8000;
 constexpr int hidInterface = 4;
 
 // The bundled XWild libuvc callback receives (bytes, user, length).
@@ -74,14 +80,22 @@ struct Camera {
     int fd = -1;
     bool streaming = false;
     bool laserMayBeOn = false;
+    bool thermalMayBeOn = false;
     std::mutex mutex;
+    std::condition_variable frameReady;
     std::array<jbyte, sampleCapacity> bytes;
     size_t length = 0;
+    std::chrono::steady_clock::time_point lastArrival;
     bool unread = false;
-    std::vector<uint8_t> previousDump;
+    std::vector<uint8_t> previousDump, nextDump;
+    std::vector<wp09::PreviewSample> samples;
+    bool collecting = false;
     bool knownDump = false;
+    QueuedHid captureHid;
 
     ~Camera() {
+        captureHid.close();
+        if (thermalMayBeOn) api.zoom(handle, outputPreview);
         if (laserMayBeOn) api.zoom(handle, laserOff);
         if (streaming) api.stop(handle);
         if (handle) api.close(handle);
@@ -123,7 +137,14 @@ void onFrame(unsigned char* data, void* opaque, size_t length) {
     std::lock_guard<std::mutex> lock(camera.mutex);
     if (length <= camera.bytes.size()) std::memcpy(camera.bytes.data(), data, length);
     camera.length = length;
+    camera.lastArrival = std::chrono::steady_clock::now();
+    if (camera.collecting && length == frameBytes && camera.samples.size() < 48) {
+        const auto now = camera.lastArrival.time_since_epoch();
+        camera.samples.emplace_back(data, std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+    }
     camera.unread = true;
+    if (camera.collecting) camera.frameReady.notify_all();
+    else camera.frameReady.notify_one();
 }
 
 using Thermometry = void (*)(int, int, float*, uint16_t*, float*, float*, float*, float*,
@@ -168,7 +189,8 @@ Java_org_thermal_wp09_Wp09Usb_open(JNIEnv* env, jclass, jint fd, jint vendor, ji
         alignas(8) std::array<unsigned char, 128> control{};
         auto* config = reinterpret_cast<StreamControl*>(control.data());
         constexpr int yuyv = 3;
-        result = api.configure(camera->handle, config, yuyv, width, height, 1, 50);
+        result = api.configure(camera->handle, config, yuyv, width, height, 50, 50);
+        if (result != 0) result = api.configure(camera->handle, config, yuyv, width, height, 1, 50);
         if (result == 0) {
             // Match the XWild preview. This libuvc fork strips isochronous packet
             // headers and counts only payload bytes when the last integer is 1.
@@ -190,15 +212,16 @@ Java_org_thermal_wp09_Wp09Usb_open(JNIEnv* env, jclass, jint fd, jint vendor, ji
     return 0;
 }
 
-extern "C" JNIEXPORT jint JNICALL
+extern "C" JNIEXPORT jlong JNICALL
 Java_org_thermal_wp09_Wp09Usb_read(JNIEnv* env, jclass, jlong pointer, jbyteArray output) {
     auto& camera = *reinterpret_cast<Camera*>(pointer);
-    std::lock_guard<std::mutex> lock(camera.mutex);
-    if (!camera.unread) return 0;
+    std::unique_lock<std::mutex> lock(camera.mutex);
+    if (!camera.frameReady.wait_for(lock, std::chrono::milliseconds(40),
+            [&camera] { return camera.unread; })) return 0;
     camera.unread = false;
     if (camera.length != frameBytes) return -static_cast<int>(camera.length);
     env->SetByteArrayRegion(output, 0, frameBytes, camera.bytes.data());
-    return frameBytes;
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(camera.lastArrival.time_since_epoch()).count();
 }
 
 extern "C" JNIEXPORT jbyteArray JNICALL
@@ -212,41 +235,153 @@ Java_org_thermal_wp09_Wp09Usb_sample(JNIEnv* env, jclass, jlong pointer) {
     return bytes;
 }
 
+static DumpResult readDump(Camera& camera, std::vector<uint8_t>& output, int64_t* announcedNs = nullptr,
+                           CameraFile file = CameraFile::rawBurst) {
+    if (camera.captureHid.active()) {
+        auto result = camera.captureHid.read(output, announcedNs, file);
+        if (result != DumpResult::failed) return result;
+        camera.captureHid.close();
+    }
+    HidInterface hid(camera.api.lib, camera.handle);
+    return hid.handle ? readThermalDump(hid.handle, hid.transfer, output, nullptr, announcedNs, file) : DumpResult::failed;
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_org_thermal_wp09_Wp09Usb_factoryKb(JNIEnv* env, jclass, jlong pointer) {
+    auto& camera = *reinterpret_cast<Camera*>(pointer);
+    std::vector<uint8_t> kb;
+    if (readDump(camera, kb, nullptr, CameraFile::factoryKb) != DumpResult::received) return nullptr;
+    auto out = env->NewByteArray(kb.size());
+    if (out) env->SetByteArrayRegion(out, 0, kb.size(), reinterpret_cast<const jbyte*>(kb.data()));
+    return out;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_thermal_wp09_Wp09Usb_setThermalOutput(JNIEnv*, jclass, jlong pointer, jboolean enabled) {
+    auto& camera = *reinterpret_cast<Camera*>(pointer);
+    if (enabled) camera.thermalMayBeOn = true;
+    int result = camera.api.zoom(camera.handle, enabled ? outputThermal : outputPreview);
+    if (!enabled && result == 0) camera.thermalMayBeOn = false;
+    std::lock_guard<std::mutex> lock(camera.mutex);
+    camera.unread = false;
+    return result == 0;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_thermal_wp09_Wp09Usb_attachCaptureFd(JNIEnv*, jclass, jlong pointer, jint fd) {
+    reinterpret_cast<Camera*>(pointer)->captureHid.attach(fd);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_thermal_wp09_Wp09Usb_queuedCapture(JNIEnv*, jclass, jlong pointer) {
+    return reinterpret_cast<Camera*>(pointer)->captureHid.active();
+}
+
+static bool primeBaseline(Camera& camera) {
+    if (!camera.knownDump) {
+        auto baseline = readDump(camera, camera.previousDump);
+        camera.knownDump = baseline == DumpResult::received || baseline == DumpResult::missing;
+    }
+    return camera.knownDump;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_thermal_wp09_Wp09Usb_prepareCapture(JNIEnv*, jclass, jlong pointer) {
+    auto& camera = *reinterpret_cast<Camera*>(pointer);
+    if (camera.knownDump) return;
+    primeBaseline(camera);
+}
+
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_org_thermal_wp09_Wp09Usb_captureRawDump(JNIEnv* env, jclass, jlong pointer,
-                                             jbyteArray reference) {
+                                             jobjectArray references, jlongArray times, jboolean burst) {
+    using namespace std::chrono;
     auto& camera = *reinterpret_cast<Camera*>(pointer);
-    HidInterface hid(camera.api.lib, camera.handle);
-    if (!hid.handle) return nullptr;
-    if (!camera.knownDump) {
-        auto baseline = readThermalDump(hid.handle, hid.transfer, camera.previousDump);
-        if (baseline == DumpResult::failed) return nullptr;
-        camera.knownDump = true;
+    if (!primeBaseline(camera)) return nullptr;
+    auto& samples = camera.samples;
+    samples.clear();
+    samples.reserve(48);
+    const auto trigger = steady_clock::now();
+    int64_t announcedNs = 0;
+    bool fresh = false;
+    auto& dump = camera.nextDump;
+    if (camera.api.zoom(camera.handle, captureRawFrames) == 0) {
+        // The sensor needs eight exposures. Start reading as soon as a burst could
+        // be ready, then retry a missing, short or unchanged file without re-triggering.
+        const auto deadline = steady_clock::now() + milliseconds(2200);
+        std::unique_lock<std::mutex> lock(camera.mutex);
+        camera.collecting = true;
+        camera.frameReady.wait_for(lock, milliseconds(220), [&] { return samples.size() >= wp09::burstFrames; });
+        lock.unlock();
+        bool retriedTransfer = false;
+        do {
+            const auto state = readDump(camera, dump, &announcedNs);
+            if (state == DumpResult::failed) {
+                if (retriedTransfer) break;
+                retriedTransfer = true;
+            }
+            // A rewrite in progress can already have a full file length. Check the
+            // last active sensor row, ignoring changes to headers and padding.
+            constexpr size_t lastRow = (wp09::burstFrames - 1) * wp09::rawFrameBytes
+                    + wp09::rawImageOffset + (wp09::height - 1) * wp09::rawStride;
+            if (state == DumpResult::received && (camera.previousDump.empty() ||
+                    std::memcmp(dump.data() + lastRow, camera.previousDump.data() + lastRow,
+                                wp09::width * 2) != 0)) {
+                fresh = true;
+                break;
+            }
+            std::this_thread::sleep_for(milliseconds(20));
+        } while (steady_clock::now() < deadline);
     }
-
-    if (camera.api.zoom(camera.handle, captureRawFrames) != 0) return nullptr;
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     {
         std::lock_guard<std::mutex> lock(camera.mutex);
-        if (camera.length != frameBytes) return nullptr;
-        env->SetByteArrayRegion(reference, 0, frameBytes, camera.bytes.data());
+        camera.collecting = false;
+        // Some firmware pauses UVC during a still capture. A recent trailer can
+        // supply calibration, but its earlier display image cannot be paired.
+        if (fresh && samples.empty() && camera.length == frameBytes &&
+                camera.lastArrival >= trigger - milliseconds(250)) {
+            samples.emplace_back(reinterpret_cast<const uint8_t*>(camera.bytes.data()), 0);
+        }
     }
-    if (env->ExceptionCheck()) return nullptr;
-
-    std::vector<uint8_t> dump;
-    auto status = readThermalDump(hid.handle, hid.transfer, dump);
-    if (status != DumpResult::received || dump == camera.previousDump) {
-        if (status == DumpResult::failed) camera.knownDump = false;
+    if (!fresh) {
+        // A delayed firmware write must become the baseline before the next trigger.
+        camera.knownDump = false;
         return nullptr;
     }
-    camera.previousDump = std::move(dump);
-    const auto length = static_cast<jsize>(camera.previousDump.size());
-    auto output = env->NewByteArray(length);
-    if (output) {
-        env->SetByteArrayRegion(output, 0, length,
-                reinterpret_cast<const jbyte*>(camera.previousDump.data()));
+    camera.previousDump.swap(dump);
+    if (samples.empty()) return nullptr;
+    const auto& raw = camera.previousDump;
+    const auto pairing = wp09::matchPreviews(raw, samples, announcedNs);
+    // When no visual match is possible, prefer calibration from the capture window.
+    auto calibration = std::upper_bound(samples.begin(), samples.end(), announcedNs,
+            [](int64_t t, const wp09::PreviewSample& sample) { return t < sample.timeNs; });
+    if (calibration != samples.begin()) --calibration;
+    std::array<jlong, wp09::burstFrames> stamps{};
+    const bool rawBurst = burst && std::any_of(pairing.begin(), pairing.end(), [](int index) { return index < 0; });
+    jbyteArray sharedCalibration = nullptr;
+    for (int i = burst ? 0 : wp09::burstFrames - 1; i < wp09::burstFrames; i++) {
+        // A gap in UVC does not erase any of the eight raw exposures. Keep the entire
+        // burst on its known file event, without assigning guessed times or preview markers.
+        int index = rawBurst ? -1 : pairing[i];
+        const auto& sample = index < 0 ? *calibration : samples[index];
+        stamps[i] = index >= 0 ? sample.timeNs : -announcedNs;
+        jbyteArray ref = sharedCalibration;
+        if (!ref) {
+            ref = env->NewByteArray(frameBytes);
+            if (!ref) return nullptr;
+            env->SetByteArrayRegion(ref, 0, frameBytes, reinterpret_cast<const jbyte*>(sample.bytes.data()));
+            if (rawBurst) sharedCalibration = ref;
+        }
+        env->SetObjectArrayElement(references, i, ref);
+        if (!rawBurst) env->DeleteLocalRef(ref);
+        if (env->ExceptionCheck()) return nullptr;
     }
-    return output;
+    if (sharedCalibration) env->DeleteLocalRef(sharedCalibration);
+    env->SetLongArrayRegion(times, 0, stamps.size(), stamps.data());
+    if (env->ExceptionCheck()) return nullptr;
+    auto out = env->NewByteArray(raw.size());
+    if (out) env->SetByteArrayRegion(out, 0, raw.size(), reinterpret_cast<const jbyte*>(raw.data()));
+    return out;
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -261,6 +396,12 @@ Java_org_thermal_wp09_Wp09Usb_laser(JNIEnv*, jclass, jlong pointer, jboolean ena
 extern "C" JNIEXPORT void JNICALL
 Java_org_thermal_wp09_Wp09Usb_close(JNIEnv*, jclass, jlong pointer) {
     delete reinterpret_cast<Camera*>(pointer);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_org_thermal_wp09_Wp09Usb_triggerShutter(JNIEnv*, jclass, jlong pointer) {
+    auto& camera = *reinterpret_cast<Camera*>(pointer);
+    return camera.api.zoom(camera.handle, forceDynamicCalibration);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -285,8 +426,12 @@ Java_org_thermal_wp09_Wp09Usb_temperatureTable(JNIEnv* env, jclass, jbyteArray f
     float humidity = 0.45f;
     uint16_t distance = 1;
     std::array<float, tableSize> table{};
-    convert(width, height, table.data(), telemetry.data(), &fpa, &correction,
-            &reflection, &air, &humidity, &emissivity, &distance, 130, 120, 0.0f);
+    {
+        static std::mutex vendorTableMutex;
+        std::lock_guard<std::mutex> lock(vendorTableMutex);
+        convert(width, height, table.data(), telemetry.data(), &fpa, &correction,
+                &reflection, &air, &humidity, &emissivity, &distance, 130, 120, 0.0f);
+    }
     env->SetFloatArrayRegion(output, 0, tableSize, table.data());
     return !env->ExceptionCheck();
 }

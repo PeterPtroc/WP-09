@@ -5,355 +5,431 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
-import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.RectF;
+import android.graphics.Rect;
 import android.graphics.Shader;
 import android.graphics.Typeface;
-import android.graphics.drawable.GradientDrawable;
+import android.os.SystemClock;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 
-import java.text.DecimalFormat;
-import java.text.DecimalFormatSymbols;
-import java.util.Locale;
+import static org.thermal.wp09.ThermalFrame.*;
 
 final class ThermalView extends View {
-    static final String[] PALETTE_NAMES = {"铁红伪彩", "彩虹伪彩", "白热", "黑热"};
-    private static final int[][] PALETTES = {
-            {0xff130f21, 0xff4d1c59, 0xffa13b66, 0xffed6350, 0xffffb963, 0xfffff1bd},
-            {0xff241057, 0xff294fc2, 0xff1dc8dc, 0xff80df62, 0xfff7dd40, 0xfff15a39},
-            {0xff000000, 0xffffffff},
-            {0xffffffff, 0xff000000}
-    };
-    private static final int[][] COLORS = new int[PALETTES.length][];
-    private static final ThreadLocal<DecimalFormat> NUMBERS = new ThreadLocal<DecimalFormat>() {
-        @Override protected DecimalFormat initialValue() {
-            return new DecimalFormat("0.0", DecimalFormatSymbols.getInstance(Locale.ROOT));
-        }
-    };
-    static {
-        for (int i = 0; i < PALETTES.length; i++) COLORS[i] = palette(PALETTES[i]);
-    }
+    final Measurement measurement = new Measurement();
+    private Bitmap bitmap = Bitmap.createBitmap(WIDTH, HEIGHT, Bitmap.Config.ARGB_8888);
+    private final int[] rendered = new int[PIXELS], lut = new int[256];
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
-    private final RectF image = new RectF();
-    private final RectF labelBox = new RectF();
-    private final Matrix frameToView = new Matrix();
-    private final Matrix viewToFrame = new Matrix();
-    private final float[] mappedPoint = new float[2];
-    private final Bitmap bitmap = Bitmap.createBitmap(ThermalFrame.WIDTH, ThermalFrame.HEIGHT,
-            Bitmap.Config.ARGB_8888);
-    private final int[] rendered = new int[ThermalFrame.PIXELS];
-    private final float density;
-    private ThermalFrame frame;
-    private Calibration calibration = Calibration.DEFAULT;
-    private boolean measuring = true;
+    private final RectF image = new RectF(), destination = new RectF();
+    private final Rect active = new Rect(0, 0, WIDTH, HEIGHT);
+    private final RectF activeDestination = new RectF();
+    private static final int COLD_COLOR = 0xffcccccc, HOT_COLOR = Color.WHITE;
+    private final ExtremumLabel coldLabel = new ExtremumLabel("低", COLD_COLOR);
+    private final ExtremumLabel hotLabel = new ExtremumLabel("高", HOT_COLOR);
+    private final Paint labelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final float density, slop;
+    private float zoom = 1, cx = WIDTH / 2f, cy = HEIGHT / 2f;
+    private float downX, downY, lastX, lastY, span;
+    private boolean multi, dragged;
+    private int dragStart, dragEnd;
+    private ThermalCapture capture;
     private int palette;
-    private int spot = ThermalFrame.CENTER;
-    private Runnable onSpotChanged;
-    private Shader scaleGradient;
-    private float gradientTop;
-    private float gradientBottom;
+    private boolean measuring = true;
+    private Shader gradient;
+    private float gradientTop, gradientBottom;
+    private Runnable onSelection;
+    private ThermalFrame lastDrawn;
+    private long fpsStart;
+    private int draws, fps;
 
     ThermalView(Context context) {
         super(context);
         density = getResources().getDisplayMetrics().density;
-        setContentDescription("红外热成像。点按画面选择测温位置");
-        setBackgroundColor(0xff111111);
+        labelPaint.setTypeface(Typeface.DEFAULT_BOLD);
+        labelPaint.setTextSize(d(12));
+        slop = ViewConfiguration.get(context).getScaledTouchSlop();
+        setContentDescription("热像。点按测温，拖动绘制线或区域，双指缩放和平移");
+        setBackgroundColor(InstrumentUi.BG);
     }
 
-    void onSpotChanged(Runnable action) {
-        onSpotChanged = action;
-    }
+    void onSpotChanged(Runnable listener) { onSelection = listener; }
+    ThermalCapture capture() { return capture; }
+    ThermalFrame drawnFrame() { return lastDrawn; }
+    int fps() { return fps; }
 
-    void show(ThermalFrame next, Calibration correction, boolean temperatureOn) {
-        boolean bitmapChanged = frame != next;
-        frame = next;
-        calibration = correction;
-        measuring = temperatureOn;
-        if (bitmapChanged) updateBitmap();
+    void setExtremaVisible(boolean hot, boolean cold) {
+        if (hotLabel.enabled == hot && coldLabel.enabled == cold) return;
+        hotLabel.enabled = hot;
+        coldLabel.enabled = cold;
         invalidate();
     }
 
-    void setPalette(int selected) {
-        palette = selected;
-        scaleGradient = null;
-        updateBitmap();
-        invalidate();
+    ThermalCapture compose(ThermalFrame frame, Calibration calibration) {
+        if (frame == null) return null;
+        return new ThermalCapture(frame, calibration, palette, Float.NaN, Float.NaN, capture != null && capture.frame == frame ? capture.movieImage : null);
     }
 
-    private void updateBitmap() {
-        if (frame != null) {
-            int[] colors = COLORS[palette];
-            if (frame.hasPixelTemperatures()) {
-                float min = frame.minimum;
-                float range = frame.maximum - min;
-                for (int i = 0; i < rendered.length; i++) {
-                    float value = frame.readings[i];
-                    int shade = range > 0 ? Math.round(255 * (value - min) / range) : 127;
-                    rendered[i] = Float.isFinite(value)
-                            ? colors[Math.max(0, Math.min(shade, 255))] : Color.BLACK;
-                }
-            } else {
-                for (int i = 0; i < rendered.length; i++) {
-                    rendered[i] = colors[frame.preview[i] & 0xff];
-                }
-            }
-            bitmap.setPixels(rendered, 0, ThermalFrame.WIDTH, 0, 0,
-                    ThermalFrame.WIDTH, ThermalFrame.HEIGHT);
+    void show(ThermalFrame frame, Calibration calibration, boolean enabled) {
+        boolean changed = measuring != enabled;
+        measuring = enabled;
+        if (frame == null && capture == null && !changed) return;
+        if (capture != null && capture.frame == frame && capture.calibration == calibration) {
+            if (changed) invalidate();
+            return;
         }
+        display(compose(frame, calibration));
+    }
+
+    /** Album playback uses the palette and temperature window saved for each frame. */
+    void display(ThermalCapture next) {
+        capture = next;
+        active.left = next == null ? 0 : next.frame.firstColumn;
+        if (next != null) {
+            measurement.start = visiblePixel(measurement.start);
+            measurement.end = visiblePixel(measurement.end);
+            if (next.palette != palette) gradient = null;
+            palette = next.palette;
+            next.render(rendered, lut);
+            if (bitmap.getWidth() != active.width())
+                bitmap = Bitmap.createBitmap(active.width(), HEIGHT, Bitmap.Config.ARGB_8888);
+            bitmap.setPixels(rendered, active.left, WIDTH, 0, 0, active.width(), HEIGHT);
+        } else {
+            fpsStart = 0;
+            fps = draws = 0;
+            lastDrawn = null;
+        }
+        invalidate();
+    }
+
+    void setPalette(int value) {
+        palette = value;
+        gradient = null;
+        if (capture != null) display(compose(capture.frame, capture.calibration));
+        else invalidate();
+    }
+
+    void resetViewport() {
+        cx = WIDTH / 2f;
+        cy = HEIGHT / 2f;
+        zoom = 1;
+        transform();
+        invalidate();
+    }
+
+    void select(Measurement.Tool tool) {
+        measurement.select(tool);
+        selectionChanged();
     }
 
     float spotReading() {
-        return frame == null ? Float.NaN : frame.temperatureAt(spot);
+        return capture == null ? Float.NaN : capture.frame.temperatureAt(measurement.start);
     }
 
     String spotDisplay() {
-        float value = calibration.apply(spotReading());
+        if (capture == null) return "—";
+        float value = capture.calibration.apply(spotReading());
         if (!Float.isFinite(value)) return "—";
-        String displayValue = frame.isInterpolatedAt(spot) ? Integer.toString(Math.round(value))
-                : number(value);
-        return displayValue + " °C";
+        return (capture.frame.isEstimatedAt(measurement.start) ? "≈" : "") + number(value) + " °C";
     }
 
     float calibrationReading() {
-        if (frame == null) return Float.NaN;
-        if (!frame.hasPixelTemperatures()) return frame.center;
-        int x = spot % ThermalFrame.WIDTH;
-        int y = spot / ThermalFrame.WIDTH;
-        float sum = 0f;
+        if (capture == null || !capture.frame.measurable(measurement.start)) return Float.NaN;
+        ThermalFrame frame = capture.frame;
+        if (!frame.hasPixelTemperatures() || frame.firmware != null) return frame.reported.center;
+        int x = measurement.start % WIDTH, y = measurement.start / WIDTH;
+        float sum = 0;
         int count = 0;
-        for (int row = Math.max(0, y - 2); row <= Math.min(ThermalFrame.HEIGHT - 1, y + 2); row++) {
-            for (int col = Math.max(0, x - 2); col <= Math.min(ThermalFrame.WIDTH - 1, x + 2); col++) {
-                float reading = frame.readings[row * ThermalFrame.WIDTH + col];
-                if (Float.isFinite(reading)) {
-                    sum += reading;
-                    count++;
-                }
+        for (int row = Math.max(0, y - 2); row <= Math.min(HEIGHT - 1, y + 2); row++) {
+            for (int col = Math.max(0, x - 2); col <= Math.min(WIDTH - 1, x + 2); col++) {
+                float value = frame.readings[row * WIDTH + col];
+                if (Float.isFinite(value)) { sum += value; count++; }
             }
         }
         return count > 0 ? sum / count : Float.NaN;
     }
 
     @Override protected void onDraw(Canvas canvas) {
-        super.onDraw(canvas);
-        drawScene(canvas, getWidth(), getHeight(), true);
-    }
-
-    void drawCapture(Bitmap target) {
-        RectF oldImage = new RectF(image);
-        Matrix oldTransform = new Matrix(frameToView);
-        Canvas canvas = new Canvas(target);
-        canvas.drawColor(0xff111111);
-        float widthDp = 530;
-        float scale = target.getWidth() / d(widthDp);
-        canvas.scale(scale, scale);
-        float height = target.getHeight() / scale;
-        boolean showReadings = measuring && frame != null && frame.hasTemperature();
-        drawScene(canvas, target.getWidth() / scale, height - (showReadings ? d(17) : 0), false);
-        if (showReadings) {
-            paint.setTypeface(Typeface.MONOSPACE);
-            paint.setColor(0xffe7e7e7);
-            paint.setTextSize(d(11));
-            String label = frame.hasPixelTemperatures()
-                    ? "平均 " + number(calibration.apply(frame.average)) + " °C     选点 " : "选点 ";
-            canvas.drawText(label + spotDisplay(), image.left, height - d(3), paint);
-        }
-        image.set(oldImage);
-        frameToView.set(oldTransform);
-    }
-
-    private void drawScene(Canvas canvas, float width, float height, boolean live) {
-        boolean showTemperatureScale = measuring && (frame == null || frame.hasPixelTemperatures());
-        float scaleWidth = measuring ? d(showTemperatureScale ? 57 : 16) : 0;
-        boolean compactBrightness = live && measuring && !showTemperatureScale
-                && width >= d(64) && height >= d(48);
-        float fullWidth = Math.max(1, width - d(4));
-        int verticalGutter = !measuring ? 4 : compactBrightness ? 8 : 24;
-        float heightLimited = Math.max(1, height - d(verticalGutter)) / ThermalFrame.HEIGHT;
-        float fullFrameWidth = Math.min(fullWidth, heightLimited * ThermalFrame.WIDTH);
-        boolean overlay = compactBrightness && fullFrameWidth + scaleWidth > fullWidth;
-        float outsideScaleWidth = overlay ? 0 : scaleWidth;
-        float available = Math.max(1, fullWidth - outsideScaleWidth);
-        float frameScale = Math.min(available / ThermalFrame.WIDTH, heightLimited);
-        float imageWidth = ThermalFrame.WIDTH * frameScale;
-        float imageHeight = ThermalFrame.HEIGHT * frameScale;
-        float left = (width - imageWidth - outsideScaleWidth) / 2;
-        float top = (height - imageHeight) / 2;
-        image.set(left, top, left + imageWidth, top + imageHeight);
-        // The external WP-09 supplies frames in camera orientation.
-        frameToView.setScale(frameScale, frameScale);
-        frameToView.postTranslate(left, top);
-        paint.setShader(null);
-        paint.setColor(0xff080808);
+        boolean degrees = measuring && capture != null && Float.isFinite(capture.low);
+        float gutter = degrees ? d(49) : 0;
+        float available = Math.max(1, getWidth() - gutter - d(4));
+        float scale = Math.min(available / active.width(), Math.max(1, getHeight() - d(degrees ? 22 : 8)) / HEIGHT);
+        float w = active.width() * scale, h = HEIGHT * scale;
+        float x = (getWidth() - w - gutter) / 2, y = (getHeight() - h) / 2;
+        image.set(x, y, x + w, y + h);
+        transform();
+        paint.setColor(0xff0b0b0b);
         canvas.drawRect(image, paint);
-        if (frame != null) canvas.drawBitmap(bitmap, frameToView, paint);
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(d(1));
-        paint.setColor(0xff3b3b3b);
-        canvas.drawRect(image, paint);
-        paint.setStyle(Paint.Style.FILL);
-
-        if (!measuring) return;
-        boolean valid = frame != null && frame.hasTemperature();
-        drawScale(canvas, valid && frame.hasPixelTemperatures(), overlay);
-        if (valid) {
-            mark(canvas, frame.cold, Color.WHITE, d(6), false,
-                    "低 " + number(calibration.apply(frame.minimum)) + "°", 0);
-            mark(canvas, frame.hot, Color.WHITE, d(6), false,
-                    "高 " + number(calibration.apply(frame.maximum)) + "°", 1);
-            mark(canvas, spot, Color.WHITE, d(9), true, null, 0);
-        }
-    }
-
-    private void drawScale(Canvas canvas, boolean valid, boolean overlay) {
-        float x = overlay ? image.right - d(11) : image.right + d(4);
-        float top = image.top;
-        float width = d(7);
-        if (overlay) {
-            paint.setColor(0xb3111111);
-            canvas.drawRect(x - d(3), top, image.right, image.bottom, paint);
-        }
-        if (frame != null) {
-            if (scaleGradient == null || gradientTop != top || gradientBottom != image.bottom) {
-                gradientTop = top;
-                gradientBottom = image.bottom;
-                scaleGradient = new LinearGradient(0, image.bottom, 0, top, PALETTES[palette],
-                        null, Shader.TileMode.CLAMP);
-            }
-            paint.setShader(scaleGradient);
-        } else {
-            paint.setColor(0xff2c2c2c);
-        }
-        canvas.drawRect(x, top, x + width, image.bottom, paint);
-        paint.setShader(null);
-        if (!valid && frame != null) return;
-        paint.setTextSize(d(11));
-        paint.setTypeface(Typeface.MONOSPACE);
-        paint.setColor(0xffbbbbbb);
-        float low = valid ? frame.minimum : Float.NaN;
-        float high = valid ? frame.maximum : Float.NaN;
-        int ticks = image.height() < d(112) ? 2 : 5;
-        for (int i = 0; i < ticks; i++) {
-            float fraction = (float) i / (ticks - 1);
-            float y = image.top + fraction * image.height();
-            canvas.drawLine(x + width, y, x + width + d(4), y, paint);
-            float reading = calibration.apply(high + (low - high) * fraction);
-            canvas.drawText(valid ? number(reading) : "–", x + width + d(5),
-                    y + d(4), paint);
-        }
-        canvas.drawText("°C", x + width + d(5), image.top - d(4), paint);
-    }
-
-    private final RectF coldLabel = new RectF();
-
-    private void mark(Canvas canvas, int index, int color, float radius, boolean crosshair,
-                      String label, int labelIndex) {
-        mappedPoint[0] = index % ThermalFrame.WIDTH + 0.5f;
-        mappedPoint[1] = index / ThermalFrame.WIDTH + 0.5f;
-        frameToView.mapPoints(mappedPoint);
-        float x = mappedPoint[0];
-        float y = mappedPoint[1];
+        if (capture == null) return;
         canvas.save();
         canvas.clipRect(image);
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(d(3.5f));
-        paint.setColor(Color.BLACK);
-        glyph(canvas, x, y, radius, crosshair);
-        paint.setStrokeWidth(d(1.5f));
-        paint.setColor(color);
-        glyph(canvas, x, y, radius, crosshair);
-        paint.setStyle(Paint.Style.FILL);
-        if (label != null) drawLabel(canvas, x, y, radius, color, label, labelIndex);
+        paint.setColor(Color.WHITE);
+        canvas.drawBitmap(bitmap, null, activeDestination, paint);
+        if (measuring && capture.frame.hasTemperature()) {
+            drawSelection(canvas);
+            drawExtrema(canvas);
+        }
         canvas.restore();
-    }
-
-    private void drawLabel(Canvas canvas, float x, float y, float radius, int color,
-                           String label, int index) {
-        paint.setTypeface(Typeface.DEFAULT_BOLD);
-        paint.setTextSize(d(11));
-        float labelWidth = paint.measureText(label) + d(10);
-        float labelHeight = d(19);
-        float left = Math.max(image.left + d(2),
-                Math.min(x + radius + d(4), image.right - labelWidth - d(2)));
-        float top = y - radius - labelHeight - d(3);
-        if (top < image.top + d(2)) top = y + radius + d(3);
-        top = Math.min(top, image.bottom - labelHeight - d(2));
-        labelBox.set(left, top, left + labelWidth, top + labelHeight);
-        if (index == 0) coldLabel.set(labelBox);
-        else if (RectF.intersects(labelBox, coldLabel)) {
-            float below = coldLabel.bottom + d(2);
-            labelBox.offsetTo(left, below + labelHeight < image.bottom
-                    ? below : coldLabel.top - labelHeight - d(2));
-        }
-        paint.setColor(0xe6212121);
-        canvas.drawRect(labelBox, paint);
-        paint.setColor(color);
-        canvas.drawText(label, labelBox.left + d(5), labelBox.bottom - d(5), paint);
-    }
-
-    private void glyph(Canvas canvas, float x, float y, float r, boolean crosshair) {
-        if (crosshair) {
-            float gap = r / 3;
-            canvas.drawLine(x - r, y, x - gap, y, paint);
-            canvas.drawLine(x + gap, y, x + r, y, paint);
-            canvas.drawLine(x, y - r, x, y - gap, paint);
-            canvas.drawLine(x, y + gap, x, y + r, paint);
-        } else {
-            canvas.drawCircle(x, y, r, paint);
+        if (degrees) drawScale(canvas);
+        if (capture.frame != lastDrawn) {
+            long now = SystemClock.elapsedRealtime();
+            if (fpsStart == 0) fpsStart = now;
+            draws++;
+            if (now - fpsStart >= 1000) {
+                fps = Math.round(draws * 1000f / (now - fpsStart));
+                draws = 0;
+                fpsStart = now;
+            }
+            lastDrawn = capture.frame;
         }
     }
 
-    @Override public boolean onTouchEvent(MotionEvent event) {
-        if (event.getAction() == MotionEvent.ACTION_DOWN)
-            return measuring && frame != null && frame.hasTemperature()
-                    && image.contains(event.getX(), event.getY());
-        if (event.getAction() == MotionEvent.ACTION_UP && image.contains(event.getX(), event.getY())
-                && frameToView.invert(viewToFrame)) {
-            mappedPoint[0] = event.getX();
-            mappedPoint[1] = event.getY();
-            viewToFrame.mapPoints(mappedPoint);
-            int x = Math.max(0, Math.min((int) mappedPoint[0], ThermalFrame.WIDTH - 1));
-            int y = Math.max(0, Math.min((int) mappedPoint[1], ThermalFrame.HEIGHT - 1));
-            spot = y * ThermalFrame.WIDTH + x;
-            performClick();
-            invalidate();
-            if (onSpotChanged != null) onSpotChanged.run();
+    private void drawExtrema(Canvas canvas) {
+        ThermalFrame f = capture.frame;
+        int hot = f.reported.hot, cold = f.reported.cold;
+        hotLabel.place(hot, capture.calibration.apply(f.reported.maximum), true, f.isEstimatedAt(hot));
+        coldLabel.place(cold, capture.calibration.apply(f.reported.minimum), false, f.isEstimatedAt(cold));
+        // At a corner both labels may flip to the same side. Stack them inside the viewport.
+        if (hotLabel.visible && coldLabel.visible && RectF.intersects(hotLabel.box, coldLabel.box)) {
+            float gap = d(2), h = coldLabel.box.height();
+            float top = Math.max(image.top, Math.min(hotLabel.box.top, image.bottom - 2 * h - gap));
+            hotLabel.box.offsetTo(hotLabel.box.left, top);
+            coldLabel.box.offsetTo(coldLabel.box.left, top + h + gap);
         }
-        return true;
+        hotLabel.draw(canvas);
+        coldLabel.draw(canvas);
+        if (hotLabel.visible) marker(canvas, hot, HOT_COLOR, false, d(4));
+        if (coldLabel.visible) marker(canvas, cold, COLD_COLOR, false, d(hotLabel.visible && hot == cold ? 2 : 4));
     }
 
-    @Override public boolean performClick() {
-        super.performClick();
-        return true;
+    private final class ExtremumLabel {
+        final String prefix;
+        final int color;
+        final RectF box = new RectF();
+        String text;
+        long tenths;
+        float x, y, width;
+        boolean enabled = true, visible;
+        boolean estimated;
+
+        ExtremumLabel(String prefix, int color) { this.prefix = prefix; this.color = color; }
+
+        void place(int pixel, float celsius, boolean above, boolean estimate) {
+            x = sx(pixel);
+            y = sy(pixel);
+            visible = enabled && pixel >= 0 && pixel < PIXELS && Float.isFinite(celsius) && image.contains(x, y);
+            if (!visible) return;
+            long rounded = Math.round((double) celsius * 10);
+            if (text == null || tenths != rounded || estimated != estimate) {
+                tenths = rounded;
+                estimated = estimate;
+                text = prefix + (estimate ? " ≈" : " ") + number(celsius) + " °C";
+                width = labelPaint.measureText(text) + d(10);
+            }
+            float gap = d(7), height = d(19);
+            float left = x + gap;
+            if (left + width > image.right) left = x - gap - width;
+            left = Math.max(image.left, Math.min(left, image.right - width));
+            float top = above ? y - gap - height : y + gap;
+            if (top < image.top) top = y + gap;
+            if (top + height > image.bottom) top = y - gap - height;
+            top = Math.max(image.top, Math.min(top, image.bottom - height));
+            box.set(left, top, left + width, top + height);
+        }
+
+        void draw(Canvas canvas) {
+            if (!visible) return;
+            float endX = Math.max(box.left, Math.min(x, box.right));
+            float endY = Math.max(box.top, Math.min(y, box.bottom));
+            labelPaint.setStrokeWidth(d(1.2f));
+            labelPaint.setColor(color);
+            canvas.drawLine(x, y, endX, endY, labelPaint);
+            labelPaint.setColor(0xe5151515);
+            canvas.drawRect(box, labelPaint);
+            labelPaint.setColor(color);
+            canvas.drawText(text, box.left + d(5), box.centerY() - (labelPaint.ascent() + labelPaint.descent()) / 2, labelPaint);
+        }
     }
+
+    private void transform() {
+        float halfW = active.width() / (2 * zoom), halfH = HEIGHT / (2 * zoom);
+        cx = Math.max(active.left + halfW, Math.min(WIDTH - halfW, cx));
+        cy = Math.max(halfH, Math.min(HEIGHT - halfH, cy));
+        float scale = image.width() / active.width() * zoom;
+        float x = image.centerX() - cx * scale, y = image.centerY() - cy * scale;
+        destination.set(x, y, x + WIDTH * scale, y + HEIGHT * scale);
+        activeDestination.set(x + active.left * scale, y, destination.right, destination.bottom);
+    }
+
+    private void drawSelection(Canvas canvas) {
+        int a = measurement.start, b = measurement.end;
+        if (measurement.tool == Measurement.Tool.POINT) {
+            marker(canvas, a, Color.WHITE, true, d(9));
+            return;
+        }
+        float ax = sx(a), ay = sy(a), bx = sx(b), by = sy(b);
+        for (int layer = 0; layer < 2; layer++) {
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(d(layer == 0 ? 3 : 1.4f));
+            paint.setColor(layer == 0 ? 0xc0000000 : InstrumentUi.ACCENT);
+            if (measurement.tool == Measurement.Tool.AREA) {
+                canvas.drawRect(Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by), paint);
+            } else canvas.drawLine(ax, ay, bx, by, paint);
+        }
+        paint.setStyle(Paint.Style.FILL);
+        canvas.drawCircle(ax, ay, d(3), paint);
+        canvas.drawCircle(bx, by, d(3), paint);
+    }
+
+    private float sx(int p) { return destination.left + (p % WIDTH + 0.5f) * destination.width() / WIDTH; }
+    private float sy(int p) { return destination.top + (p / WIDTH + 0.5f) * destination.height() / HEIGHT; }
+
+    private void marker(Canvas canvas, int p, int color, boolean point, float r) {
+        float x = sx(p), y = sy(p);
+        paint.setStyle(Paint.Style.STROKE);
+        for (int i = 0; i < 2; i++) {
+            paint.setStrokeWidth(d(i == 0 ? 3 : 1.4f));
+            paint.setColor(i == 0 ? 0xd0000000 : color);
+            if (point) {
+                canvas.drawLine(x - r, y, x - r / 3, y, paint);
+                canvas.drawLine(x + r / 3, y, x + r, y, paint);
+                canvas.drawLine(x, y - r, x, y - r / 3, paint);
+                canvas.drawLine(x, y + r / 3, x, y + r, paint);
+            } else canvas.drawCircle(x, y, r, paint);
+        }
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    private void drawScale(Canvas canvas) {
+        float x = image.right + d(5);
+        if (gradient == null || image.top != gradientTop || image.bottom != gradientBottom) {
+            gradientTop = image.top;
+            gradientBottom = image.bottom;
+            gradient = new LinearGradient(0, image.bottom, 0, image.top, ThermalCapture.STOPS[palette], null, Shader.TileMode.CLAMP);
+        }
+        paint.setColor(Color.WHITE);
+        paint.setShader(gradient);
+        canvas.drawRect(x, image.top, x + d(6), image.bottom, paint);
+        paint.setShader(null);
+        paint.setTypeface(Typeface.MONOSPACE);
+        paint.setTextSize(d(10));
+        paint.setColor(0xffdddddd);
+        for (int i = 0; i < 5; i++) {
+            float f = i / 4f;
+            float y = image.top + f * image.height();
+            canvas.drawLine(x + d(6), y, x + d(9), y, paint);
+            canvas.drawText(number(capture.high + (capture.low - capture.high) * f), x + d(11), y + d(3), paint);
+        }
+        canvas.drawText("°C", x + d(11), image.top - d(1), paint);
+    }
+
+    @Override public boolean onTouchEvent(MotionEvent e) {
+        float x = e.getX(), y = e.getY();
+        switch (e.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                if (capture == null) return false;
+                if (!image.contains(x, y)) return false;
+                downX = lastX = x;
+                downY = lastY = y;
+                multi = dragged = false;
+                dragStart = measurement.start;
+                dragEnd = measurement.end;
+                return true;
+            case MotionEvent.ACTION_POINTER_DOWN:
+                if (e.getPointerCount() == 2) {
+                    multi = true;
+                    span = span(e);
+                    lastX = (x + e.getX(1)) / 2;
+                    lastY = (y + e.getY(1)) / 2;
+                    // Cancel any tentative one-finger selection when the second finger arrives.
+                    if (measurement.start != dragStart || measurement.end != dragEnd) {
+                        measurement.start = dragStart;
+                        measurement.end = dragEnd;
+                        selectionChanged();
+                    }
+                }
+                return true;
+            case MotionEvent.ACTION_MOVE:
+                if (multi && e.getPointerCount() == 2) {
+                    float midX = (x + e.getX(1)) / 2, midY = (y + e.getY(1)) / 2;
+                    float distance = span(e);
+                    float oldScale = destination.width() / WIDTH;
+                    float anchorX = cx + (lastX - image.centerX()) / oldScale;
+                    float anchorY = cy + (lastY - image.centerY()) / oldScale;
+                    if (span > 1) zoom = Math.max(1, Math.min(12, zoom * distance / span));
+                    float newScale = image.width() * zoom / active.width();
+                    cx = anchorX - (midX - image.centerX()) / newScale;
+                    cy = anchorY - (midY - image.centerY()) / newScale;
+                    span = distance;
+                    lastX = midX;
+                    lastY = midY;
+                    transform();
+                    invalidate();
+                } else if (!multi) {
+                    dragged |= Math.hypot(x - downX, y - downY) > slop;
+                    if (dragged && measurement.tool == Measurement.Tool.POINT && zoom > 1) {
+                        float scale = destination.width() / WIDTH;
+                        cx -= (x - lastX) / scale;
+                        cy -= (y - lastY) / scale;
+                        transform();
+                        invalidate();
+                    } else if (dragged && measurement.tool != Measurement.Tool.POINT && measuring) {
+                        setEndpoints(x, y);
+                    }
+                    lastX = x;
+                    lastY = y;
+                }
+                return true;
+            case MotionEvent.ACTION_UP:
+                if (!multi && measuring && capture != null && capture.frame.hasTemperature()) {
+                    if (measurement.tool != Measurement.Tool.POINT) setEndpoints(x, y);
+                    else if (!dragged && image.contains(x, y)) {
+                        measurement.start = measurement.end = toPixel(x, y);
+                        selectionChanged();
+                    }
+                }
+                performClick();
+                return true;
+            case MotionEvent.ACTION_CANCEL:
+                multi = false;
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    private static float span(MotionEvent e) {
+        return (float) Math.hypot(e.getX(1) - e.getX(), e.getY(1) - e.getY());
+    }
+
+    private void setEndpoints(float x, float y) {
+        measurement.start = toPixel(downX, downY);
+        measurement.end = toPixel(x, y);
+        selectionChanged();
+    }
+
+    private int toPixel(float x, float y) {
+        return visiblePixel(Measurement.pixel((int) ((x - destination.left) * WIDTH / destination.width()),
+                (int) ((y - destination.top) * HEIGHT / destination.height())));
+    }
+
+    private int visiblePixel(int index) {
+        return index + Math.max(0, active.left - index % WIDTH);
+    }
+
+    private void selectionChanged() {
+        invalidate();
+        if (onSelection != null) onSelection.run();
+    }
+
+    @Override public boolean performClick() { super.performClick(); return true; }
 
     static String number(float value) {
-        return Float.isFinite(value) ? NUMBERS.get().format(value) : "—";
+        if (!Float.isFinite(value)) return "—";
+        long tenths = Math.round((double) value * 10);
+        long abs = Math.abs(tenths);
+        return (tenths < 0 ? "−" : "") + abs / 10 + "." + abs % 10;
     }
-
-    static GradientDrawable swatch(int palette) {
-        return new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
-                PALETTES[palette]);
-    }
-
-    private float d(float dp) { return dp * density; }
-
-    private static int[] palette(int[] stops) {
-        int[] colors = new int[256];
-        for (int i = 0; i < colors.length; i++) {
-            float point = i * (stops.length - 1f) / (colors.length - 1);
-            int segment = Math.min((int) point, stops.length - 2);
-            float f = point - segment;
-            int a = stops[segment], b = stops[segment + 1];
-            colors[i] = Color.rgb(mix(Color.red(a), Color.red(b), f),
-                    mix(Color.green(a), Color.green(b), f),
-                    mix(Color.blue(a), Color.blue(b), f));
-        }
-        return colors;
-    }
-
-    private static int mix(int a, int b, float f) {
-        return Math.round(a + (b - a) * f);
-    }
+    private float d(float value) { return density * value; }
 }

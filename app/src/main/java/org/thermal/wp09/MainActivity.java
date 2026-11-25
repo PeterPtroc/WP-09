@@ -8,8 +8,6 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.content.res.Configuration;
-import android.content.res.ColorStateList;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
@@ -19,12 +17,12 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.media.AudioManager;
+import android.media.ToneGenerator;
 import android.text.InputType;
-import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.ArrayAdapter;
 import android.widget.EditText;
@@ -38,12 +36,7 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.appcompat.widget.AppCompatTextView;
 import androidx.core.content.ContextCompat;
-import androidx.core.view.WindowCompat;
-import androidx.core.view.WindowInsetsCompat;
-import androidx.core.view.WindowInsetsControllerCompat;
-import androidx.core.widget.TextViewCompat;
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 
@@ -55,14 +48,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.function.DoubleConsumer;
 
+import static org.thermal.wp09.InstrumentUi.*;
+
 public final class MainActivity extends AppCompatActivity {
     private static final String USB_PERMISSION = "org.thermal.wp09.USB_PERMISSION";
     private static final int CAMERA_PERMISSION = 1;
-    private static final int BG = 0xff151515;
-    private static final int PANEL = 0xff222222;
-    private static final int TEXT = 0xffeeeeee;
-    private static final int MUTED = 0xffbbbbbb;
-
     private UsbManager usb;
     private SharedPreferences settings;
     private CameraController camera;
@@ -74,15 +64,21 @@ public final class MainActivity extends AppCompatActivity {
     private boolean capturingFullFrame;
     private boolean viewingSnapshot;
     private boolean measuring = true;
+    private boolean paused, pullingVideoMaps;
+    private long lastPanelAt, mapRateStartNs, snapshotReadMs;
+    private int mapsReceived, pendingVideoBatches;
+    private String mapRate = "";
+    private final TemperatureAlarm alarms = new TemperatureAlarm();
+    private ToneGenerator tone;
     private boolean laser;
-    private boolean laserBusy;
+    private boolean laserBusy, shutterBusy;
     private boolean recording;
     private boolean recordingStarting;
     private int recordingRequest;
     private int palette;
     private float emissivity;
-    private long pluggedAt;
     private ThermalFrame frame;
+    private ThermalFrame previousStill;
     private ThermalFrame liveFrame;
     private UsbSample pendingSample;
     private final ActivityResultLauncher<String> sampleDestination =
@@ -97,14 +93,10 @@ public final class MainActivity extends AppCompatActivity {
     private float lowCalibrationReading = Float.NaN;
     private float lowCalibrationReference;
     private ThermalView thermal;
-    private LinearLayout root, header, metrics, body, toolsPanel;
-    private LinearLayout captureControls, settingsControls;
-    private ScrollView toolsScroll;
-    private FrameLayout preview;
-    private TextView status, empty, hot, cold, average, spot;
-    private MaterialButton laserButton, measurementButton, calibrationButton, paletteButton;
-    private MaterialButton emissivityButton, photoButton, videoButton;
-    private MaterialButton fullFrameButton;
+    private LinearLayout root;
+    private InspectionPanel inspection;
+    private TextView status, empty, fps, alarmBanner;
+    private MaterialButton photoButton, videoButton, galleryButton, pauseButton, shutterButton, fullFrameButton;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -145,153 +137,146 @@ public final class MainActivity extends AppCompatActivity {
         camera = new CameraController(usb);
         camera.setEmissivity(emissivity);
         media = new ThermalMedia(this, this::message);
+        alarms.low = settings.getFloat("alarmLow", Float.NaN);
+        alarms.high = settings.getFloat("alarmHigh", Float.NaN);
         buildUi();
     }
 
     private void buildUi() {
-        root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
+        root = row(this);
         root.setBackgroundColor(BG);
-        if (Build.VERSION.SDK_INT >= 35) {
-            root.setOnApplyWindowInsetsListener((view, insets) -> {
-                android.graphics.Insets safe = insets.getInsets(
-                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
-                view.setPadding(safe.left, safe.top, safe.right, safe.bottom);
-                return insets;
-            });
-        }
         setContentView(root);
-
-        header = horizontal();
-        header.setBaselineAligned(false);
-        header.setPadding(dp(10), 0, dp(10), 0);
-        TextView title = text("WP-09 热成像", 17, TEXT);
-        title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        title.setMinHeight(dp(44));
-        title.setPadding(0, dp(4), dp(8), dp(4));
-        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        title.setGravity(Gravity.CENTER_VERTICAL);
-        status = text("等待 USB", 12, MUTED);
-        status.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
-        status.setMaxWidth(dp(105));
-        status.setPadding(0, dp(4), 0, dp(4));
-        status.setOnClickListener(view -> {
-            if (!streaming && !requested) {
-                selected = null;
-                discover();
-            }
-        });
-        status.setOnLongClickListener(view -> {
-            if (viewingSnapshot) {
-                pendingTemperatureFrame = frame;
-                pendingTemperatureCalibration = calibration;
-                temperatureDestination.launch("WP09-全图温度-摄氏.csv");
-            } else {
-                showUsbDiagnostics();
-            }
-            return true;
-        });
-        header.addView(status);
-        root.addView(header);
-
-        metrics = horizontal();
-        metrics.setBackgroundColor(PANEL);
-        metrics.setPadding(dp(8), 0, dp(8), 0);
-        hot = metric(metrics, "最高", TEXT);
-        cold = metric(metrics, "最低", TEXT);
-        average = metric(metrics, "平均", TEXT);
-        spot = metric(metrics, "选点", TEXT);
-        root.addView(metrics);
-
-        body = new LinearLayout(this);
-        root.addView(body, new LinearLayout.LayoutParams(-1, 0, 1));
-        preview = new FrameLayout(this);
+        landscape(this, root);
+        FrameLayout preview = new FrameLayout(this);
+        root.addView(preview, new LinearLayout.LayoutParams(0, -1, 1));
         thermal = new ThermalView(this);
         thermal.setPalette(palette);
-        thermal.onSpotChanged(this::render);
         preview.addView(thermal, new FrameLayout.LayoutParams(-1, -1));
-        empty = text("等待 WP-09 接入", 14, MUTED);
-        empty.setBackgroundColor(0xe3222222);
+        empty = text(this, "等待 WP-09 接入", 15, MUTED);
         empty.setGravity(Gravity.CENTER);
-        empty.setPadding(dp(14), dp(8), dp(14), dp(8));
-        FrameLayout.LayoutParams emptyLayout = new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER);
-        preview.addView(empty, emptyLayout);
-        body.addView(preview);
-        toolsScroll = new ScrollView(this);
-        toolsScroll.setFillViewport(true);
-        body.addView(toolsScroll);
-        toolsPanel = new LinearLayout(this);
-        toolsPanel.setOrientation(LinearLayout.VERTICAL);
-        toolsPanel.setGravity(Gravity.CENTER_VERTICAL);
-        toolsScroll.addView(toolsPanel, new FrameLayout.LayoutParams(-1, -2));
+        preview.addView(empty, new FrameLayout.LayoutParams(-1, -1));
+        alarmBanner = text(this, "", 14, BG);
+        alarmBanner.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        alarmBanner.setPadding(dp(12), dp(4), dp(12), dp(4));
+        FrameLayout.LayoutParams banner = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        banner.topMargin = dp(6);
+        preview.addView(alarmBanner, banner);
 
-        captureControls = controlGroup();
-        LinearLayout laserAndPhoto = controlPair(captureControls);
-        laserButton = control(laserAndPhoto, "激光", R.drawable.ic_zap, this::toggleLaser);
-        photoButton = control(laserAndPhoto, "拍照", R.drawable.ic_camera, () -> media.photo(thermal));
-        LinearLayout videoAndMeasurement = controlPair(captureControls);
-        videoButton = control(videoAndMeasurement, "录像", R.drawable.ic_video, this::toggleVideo);
-        measurementButton = control(videoAndMeasurement, "测温", R.drawable.ic_thermometer, () -> {
-            measuring = !measuring;
-            render();
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setBackgroundColor(PANEL);
+        root.addView(scroll, new LinearLayout.LayoutParams(dp(226), -1));
+        LinearLayout panel = new LinearLayout(this);
+        panel.setGravity(Gravity.CENTER_VERTICAL);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(8), dp(5), dp(8), dp(5));
+        scroll.addView(panel);
+        LinearLayout header = row(this);
+        header.setPadding(dp(6), 0, dp(6), 0);
+        panel.addView(header);
+        TextView title = text(this, "WP-09", 18, TEXT);
+        title.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        fps = text(this, "", 12, ACCENT);
+        header.addView(fps);
+        status = text(this, "等待 USB", 12, MUTED);
+        status.setPadding(dp(6), 0, 0, dp(5));
+        panel.addView(status);
+        status.setOnClickListener(v -> { if (!streaming && !requested) { selected = null; discover(); } });
+        View.OnLongClickListener diagnostic = v -> {
+            if (frame != null && frame.hasPixelTemperatures() && (viewingSnapshot || paused)) {
+                pendingTemperatureFrame = frame;
+                pendingTemperatureCalibration = calibration;
+                temperatureDestination.launch(frame.thermalOutput ? "WP09-全图温度-摄氏.csv" : "WP09-原始估温-摄氏.csv");
+            } else showUsbDiagnostics();
+            return true;
+        };
+        status.setOnLongClickListener(diagnostic);
+        header.setOnLongClickListener(diagnostic);
+
+        LinearLayout captureRow = row(this);
+        panel.addView(captureRow);
+        photoButton = action(captureRow, "拍照", R.drawable.ic_camera, this::takePhoto);
+        videoButton = action(captureRow, "录像", R.drawable.ic_video, this::toggleVideo);
+        galleryButton = action(captureRow, "相册", R.drawable.ic_gallery,
+                () -> startActivity(new Intent(this, GalleryActivity.class)));
+
+        inspection = new InspectionPanel(this, thermal);
+        inspection.setPadding(0, dp(6), 0, dp(4));
+        panel.addView(inspection);
+        LinearLayout rangeRow = row(this);
+        panel.addView(rangeRow);
+        pauseButton = action(rangeRow, "定格", R.drawable.ic_pause, () -> {
+            if (viewingSnapshot || paused) resumePreview();
+            else if (thermal.drawnFrame() != null) {
+                frame = thermal.drawnFrame();
+                paused = true;
+                inspection.reset();
+                render();
+            }
         });
-
-        settingsControls = controlGroup();
-        settingsControls.setPadding(dp(5), 0, dp(5), dp(2));
-        LinearLayout paletteAndEmissivity = controlPair(settingsControls);
-        paletteButton = control(paletteAndEmissivity, "", R.drawable.ic_palette, this::choosePalette);
-        emissivityButton = control(paletteAndEmissivity, "", R.drawable.ic_sliders_horizontal,
-                this::chooseEmissivity);
-        LinearLayout calibrationAndFullFrame = controlPair(settingsControls);
-        calibrationButton = control(calibrationAndFullFrame, "校准", R.drawable.ic_crosshair,
-                this::chooseCalibration);
-        fullFrameButton = control(calibrationAndFullFrame, "全图", R.drawable.ic_thermal,
-                this::toggleFullFrame);
-        updateLayout(getResources().getConfiguration());
+        shutterButton = action(rangeRow, "快门校准", R.drawable.ic_crosshair, this::triggerShutter);
+        LinearLayout options = row(this);
+        panel.addView(options);
+        fullFrameButton = action(options, "全图", R.drawable.ic_grid, this::toggleFullFrame);
+        action(options, "设置", R.drawable.ic_sliders_horizontal, this::settingsMenu);
         render();
     }
 
-    @Override public void onConfigurationChanged(Configuration configuration) {
-        super.onConfigurationChanged(configuration);
-        updateLayout(configuration);
+    private void settingsMenu() {
+        String[] entries = {"色彩　" + ThermalCapture.PALETTE_NAMES[palette], "高低温提醒",
+                "发射率　" + emissivity, Float.isFinite(lowCalibrationReading) ? "校准高点" : "参考温度校准",
+                laser ? "关闭激光" : "开启激光", measuring ? "隐藏测量标记" : "显示测量标记",
+                "复位画面"};
+        dialog().setTitle("设置").setItems(entries, (d, i) -> {
+            switch (i) {
+                case 0: choosePalette(); break;
+                case 1: chooseAlarm(); break;
+                case 2: chooseEmissivity(); break;
+                case 3: if (frame != null && frame.hasTemperature()) chooseCalibration();
+                        else message("等待测温数据"); break;
+                case 4: if (streaming) toggleLaser(); else message("请连接 WP-09"); break;
+                case 5: measuring = !measuring; render(); break;
+                case 6: thermal.resetViewport(); break;
+            }
+        }).show();
     }
 
-    @Override public void onWindowFocusChanged(boolean hasFocus) {
-        super.onWindowFocusChanged(hasFocus);
-        if (hasFocus && root != null) updateSystemBars(getResources().getConfiguration());
+    private void triggerShutter() {
+        if (!streaming || shutterBusy || !CameraController.supportsFullFrame(selected)) return;
+        shutterBusy = true;
+        render();
+        camera.triggerShutter(ok -> {
+            shutterBusy = false;
+            message(ok ? "已触发快门校准" : "快门校准指令未确认");
+            render();
+        });
     }
 
-    private void updateLayout(Configuration configuration) {
-        boolean wide = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-                && configuration.screenWidthDp >= 520;
-        body.setOrientation(wide ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-        preview.setLayoutParams(wide ? new LinearLayout.LayoutParams(0, -1, 1)
-                : new LinearLayout.LayoutParams(-1, 0, 1));
-        toolsScroll.setLayoutParams(wide ? new LinearLayout.LayoutParams(dp(228), -1)
-                : new LinearLayout.LayoutParams(-1, -2));
-        float fontScale = Math.max(1, configuration.fontScale);
-        layoutControls(captureControls, !wide && configuration.screenWidthDp >= 248 * fontScale);
-        layoutControls(settingsControls, !wide && configuration.screenWidthDp >= 336 * fontScale);
-        LinearLayout panel = wide ? toolsPanel : root;
-        if (header.getParent() != panel) {
-            LinearLayout previous = wide ? root : toolsPanel;
-            previous.removeView(header);
-            previous.removeView(metrics);
-            panel.addView(header, 0);
-            panel.addView(metrics, 1);
-        }
-        updateSystemBars(configuration);
+    private void chooseAlarm() {
+        TemperatureControls.show(this, alarms.low, alarms.high, (low, high) -> {
+            alarms.low = low;
+            alarms.high = high;
+            alarms.state = 0;
+            settings.edit().putFloat("alarmLow", low).putFloat("alarmHigh", high).apply();
+            checkAlarm(liveFrame);
+        });
     }
 
-    private void updateSystemBars(Configuration configuration) {
-        WindowInsetsControllerCompat controller = WindowCompat.getInsetsController(getWindow(), root);
-        int bars = WindowInsetsCompat.Type.systemBars();
-        if (configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
-            controller.setSystemBarsBehavior(
-                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
-            controller.hide(bars);
-        } else {
-            controller.show(bars);
+    private void checkAlarm(ThermalFrame current) {
+        int before = alarms.state;
+        int entered = alarms.update(current, calibration);
+        if (before == alarms.state && alarmBanner.getVisibility() == (before == 0 ? View.GONE : View.VISIBLE)) return;
+        alarmBanner.setVisibility(alarms.state == 0 ? View.GONE : View.VISIBLE);
+        if (alarms.state == 0) return;
+        boolean high = (alarms.state & TemperatureAlarm.HIGH) != 0;
+        alarmBanner.setBackgroundColor(high ? 0xffeeeeee : 0xffbdbdbd);
+        alarmBanner.setText(alarms.state == 3 ? "实时 · 高温 / 低温" : high ? "实时 · 高温" : "实时 · 低温");
+        if (entered != 0) {
+            try {
+                if (tone == null) tone = new ToneGenerator(AudioManager.STREAM_NOTIFICATION, 70);
+                tone.startTone(ToneGenerator.TONE_PROP_BEEP, 180);
+            } catch (RuntimeException ignored) { /* Visual alert remains available. */ }
         }
     }
 
@@ -317,6 +302,7 @@ public final class MainActivity extends AppCompatActivity {
     @Override protected void onDestroy() {
         camera.destroy();
         media.destroy();
+        if (tone != null) tone.release();
         super.onDestroy();
     }
 
@@ -368,63 +354,106 @@ public final class MainActivity extends AppCompatActivity {
 
     private void connect() {
         status.setText("正在连接");
-        empty.setText("正在读取 WP-09");
-        pluggedAt = SystemClock.elapsedRealtime();
-        camera.start(selected, next -> {
-            streaming = true;
-            liveFrame = next;
-            if (!viewingSnapshot) {
-                frame = next;
-                render();
-            }
-            if (recording) media.frame(thermal, () -> {
-                recording = false;
-                recordingStarting = false;
-                render();
-            });
-        }, message -> {
+        empty.setText("正在读取全图测温");
+        camera.start(selected, this::receive, message -> {
             disconnect();
             status.setText("连接失败");
             empty.setText(message);
         });
     }
 
+    void receive(ThermalFrame next) {
+        boolean first = !streaming;
+        streaming = true;
+        liveFrame = next;
+        if (!(recording && pullingVideoMaps)) checkAlarm(next);
+        if (!viewingSnapshot && !paused) {
+            frame = next;
+            thermal.show(frame, calibration, measuring);
+            long now = SystemClock.elapsedRealtime();
+            if (first || now - lastPanelAt >= 120) render();
+        }
+        if (recording && !pullingVideoMaps && next.hasPixelTemperatures()) recordFrame(thermal.capture());
+    }
+
     private void disconnect() {
         camera.stop();
         stopVideo();
+        status.setText("等待 USB");
         selected = null;
         frame = null;
         liveFrame = null;
+        previousStill = null;
+        paused = false;
+        thermal.resetViewport();
+        inspection.reset();
+        checkAlarm(null);
         capturingFullFrame = false;
         viewingSnapshot = false;
         requested = false;
         streaming = false;
         laser = false;
-        laserBusy = false;
+        laserBusy = shutterBusy = false;
         lowCalibrationReading = Float.NaN;
+        render();
+    }
+
+    private void resumePreview() {
+        previousStill = null;
+        paused = viewingSnapshot = false;
+        frame = liveFrame;
+        inspection.reset();
         render();
     }
 
     private void toggleFullFrame() {
         if (viewingSnapshot) {
-            viewingSnapshot = false;
-            frame = liveFrame;
-            render();
+            if (previousStill == null) resumePreview();
+            else {
+                frame = previousStill;
+                previousStill = null;
+                paused = true;
+                viewingSnapshot = false;
+                inspection.reset();
+                render();
+            }
             return;
         }
-        if (!streaming || capturingFullFrame || recording || recordingStarting
-                || !CameraController.supportsFullFrame(selected)) return;
+        ThermalFrame visible = paused ? frame : thermal.drawnFrame();
+        if (visible != null && visible.hasPixelTemperatures()) {
+            frame = visible;
+            snapshotReadMs = 0;
+            paused = false;
+            viewingSnapshot = true;
+            render();
+        } else captureMap(false);
+    }
+
+    private void takePhoto() {
+        if (frame == null || capturingFullFrame) return;
+        if (!paused && !frame.hasPixelTemperatures() && CameraController.supportsFullFrame(selected)) {
+            captureMap(true);
+        } else media.photo(thermal.capture());
+    }
+
+    private void captureMap(boolean save) {
+        if (capturingFullFrame || !streaming || !CameraController.supportsFullFrame(selected)) return;
         capturingFullFrame = true;
+        Calibration correction = calibration;
+        long startedAt = SystemClock.elapsedRealtime();
         render();
         camera.captureFullFrame(snapshot -> {
             capturingFullFrame = false;
-            if (snapshot == null) {
-                message("全图读取失败，请重试");
-            } else {
+            if (snapshot == null) message("未取得全图，请重试");
+            else if (save) media.photo(thermal.compose(snapshot, correction));
+            else {
+                previousStill = paused ? frame : null;
                 frame = snapshot;
+                snapshotReadMs = SystemClock.elapsedRealtime() - startedAt;
+                paused = false;
                 viewingSnapshot = true;
                 measuring = true;
-                message("点按选点，长按右上角导出温度");
+                inspection.reset();
             }
             render();
         });
@@ -446,8 +475,8 @@ public final class MainActivity extends AppCompatActivity {
                     for (int y = 0; y < ThermalFrame.HEIGHT; y++) {
                         for (int x = 0; x < ThermalFrame.WIDTH; x++) {
                             if (x != 0) writer.write(',');
-                            float value = correction.apply(snapshot.readings[y * ThermalFrame.WIDTH + x]);
-                            writer.write(Float.toString(Math.round(value * 10f) / 10f));
+                            float value = correction.apply(snapshot.temperatureAt(y * ThermalFrame.WIDTH + x));
+                            writer.write(Float.isFinite(value) ? Float.toString(Math.round(value * 10f) / 10f) : "NaN");
                         }
                         writer.newLine();
                     }
@@ -509,38 +538,89 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void toggleVideo() {
-        if (recording) {
-            stopVideo();
-        } else if (!recordingStarting && streaming) {
-            recordingStarting = true;
-            int request = ++recordingRequest;
-            media.start(ok -> {
-                if (request != recordingRequest) return;
-                recordingStarting = false;
-                recording = ok;
-                if (ok) media.frame(thermal, () -> {
-                    recording = false;
-                    render();
-                });
-                render();
-            });
-        }
+        if (recording) { stopVideo(); render(); return; }
+        if (recordingStarting || !streaming || paused || viewingSnapshot || capturingFullFrame || frame == null) return;
+        pullingVideoMaps = CameraController.supportsFullFrame(selected);
+        if (!pullingVideoMaps && !frame.hasPixelTemperatures()) return;
+        mapRateStartNs = System.nanoTime();
+        mapsReceived = 0;
+        pendingVideoBatches = 0;
+        mapRate = "";
+        recordingStarting = true;
+        int request = ++recordingRequest;
+        media.start(ok -> {
+            if (request != recordingRequest) return;
+            recordingStarting = false;
+            recording = ok;
+            if (ok) {
+                if (pullingVideoMaps) nextVideoMap(request);
+                else if (liveFrame != null && liveFrame.hasPixelTemperatures())
+                    recordFrame(thermal.compose(liveFrame, calibration));
+            }
+            render();
+        });
         render();
+    }
+
+    private void nextVideoMap(int request) {
+        if (request != recordingRequest || !recording || capturingFullFrame || pendingVideoBatches >= 2) return;
+        capturingFullFrame = true;
+        Calibration correction = calibration;
+        camera.captureMaps(true, frames -> {
+            capturingFullFrame = false;
+            if (request != recordingRequest || !recording) { render(); return; }
+            if (frames.length == 0) {
+                stopVideo();
+                message("全图取样中断");
+                render();
+                return;
+            }
+            ThermalCapture[] captures = new ThermalCapture[frames.length];
+            for (int i = 0; i < frames.length; i++) {
+                captures[i] = thermal.compose(frames[i], correction);
+                checkAlarm(frames[i]);
+            }
+            mapsReceived += frames.length;
+            long now = System.nanoTime();
+            if (now - mapRateStartNs >= 1_000_000_000L) {
+                mapRate = ThermalView.number(mapsReceived * 1_000_000_000f / (now - mapRateStartNs)) + " 测温帧/秒";
+                mapsReceived = 0;
+                mapRateStartNs = now;
+                render();
+            }
+            pendingVideoBatches++;
+            media.burst(captures, ok -> {
+                if (request != recordingRequest || !recording) return;
+                pendingVideoBatches--;
+                if (!ok) { stopVideo(); render(); return; }
+                nextVideoMap(request);
+            });
+            // Overlap the next USB read with encoding. A slow encoder can hold two batches.
+            nextVideoMap(request);
+        });
+    }
+
+    private void recordFrame(ThermalCapture capture) {
+        int request = recordingRequest;
+        media.frame(capture, () -> {
+            if (request == recordingRequest) { stopVideo(); render(); }
+        });
     }
 
     private void stopVideo() {
         recordingRequest++;
+        if (pullingVideoMaps) camera.endMapVideo();
         if (recording || recordingStarting) media.stop();
-        recording = false;
-        recordingStarting = false;
+        if (recording && pullingVideoMaps) frame = liveFrame;
+        recording = recordingStarting = pullingVideoMaps = false;
     }
 
     private void choosePalette() {
         ArrayAdapter<String> options = new ArrayAdapter<String>(this,
-                android.R.layout.select_dialog_singlechoice, ThermalView.PALETTE_NAMES) {
+                android.R.layout.select_dialog_singlechoice, ThermalCapture.PALETTE_NAMES) {
             @Override public View getView(int position, View recycled, ViewGroup parent) {
                 TextView label = (TextView) super.getView(position, recycled, parent);
-                GradientDrawable swatch = ThermalView.swatch(position);
+                GradientDrawable swatch = ThermalCapture.swatch(position);
                 swatch.setBounds(0, 0, dp(46), dp(14));
                 label.setCompoundDrawablesRelative(swatch, null, null, null);
                 label.setCompoundDrawablePadding(dp(14));
@@ -565,8 +645,9 @@ public final class MainActivity extends AppCompatActivity {
             float value = (float) entered;
             if (value == emissivity) return;
             emissivity = value;
-            if (viewingSnapshot) {
-                viewingSnapshot = false;
+            if (viewingSnapshot || paused) {
+                previousStill = null;
+                viewingSnapshot = paused = false;
                 frame = liveFrame;
             }
             camera.setEmissivity(value);
@@ -596,7 +677,7 @@ public final class MainActivity extends AppCompatActivity {
             return;
         }
         String label = !twoPoint ? "参考温度" : highPoint ? "高温参考点" : "低温参考点";
-        String location = frame.hasPixelTemperatures() ? "所选区域读数 " : "画面中心读数 ";
+        String location = frame.hasPixelTemperatures() && frame.firmware == null ? "所选区域读数 " : "画面中心读数 ";
         editNumber(label, location + ThermalView.number(reading) + " °C",
                 reading, entered -> {
                     float reference = (float) entered;
@@ -618,6 +699,7 @@ public final class MainActivity extends AppCompatActivity {
     private void editNumber(String title, String description, float initial, DoubleConsumer apply) {
         EditText field = new EditText(this);
         field.setSingleLine(true);
+        field.setImeOptions(android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI);
         field.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL
                 | InputType.TYPE_NUMBER_FLAG_SIGNED);
         field.setText(String.format(Locale.ROOT, "%.2f", initial));
@@ -655,6 +737,8 @@ public final class MainActivity extends AppCompatActivity {
 
     private void saveCalibration(Calibration value) {
         calibration = value;
+        inspection.reset();
+        checkAlarm(liveFrame);
         settings.edit().putFloat("scale", value.scale).putFloat("offset", value.offset)
                 .putBoolean("calibrated", value.applied).apply();
         render();
@@ -662,160 +746,45 @@ public final class MainActivity extends AppCompatActivity {
 
     private void render() {
         thermal.show(frame, calibration, measuring);
-        boolean valid = frame != null && frame.hasTemperature();
-        boolean shown = measuring && valid;
+        lastPanelAt = SystemClock.elapsedRealtime();
         empty.setVisibility(frame == null ? View.VISIBLE : View.GONE);
+        inspection.setVisibility(measuring ? View.VISIBLE : View.GONE);
+        if (measuring) inspection.refresh(frame == null ? 0 : frame.capturedNanos / 1_000_000, true);
+        boolean valid = frame != null && frame.hasTemperature();
         if (streaming) {
-            String message;
-            if (capturingFullFrame) message = "读取全图";
-            else if (viewingSnapshot) message = "全图温度";
-            else if (recording) message = "正在录像";
-            else if (valid && !frame.hasPixelTemperatures()) message = calibration.applied
-                    ? "预览测温 · 已校准" : "预览测温";
-            else if (valid) message = calibration.applied ? "已连接 · 已校准" : "已连接 · 未现场校准";
-            else message = SystemClock.elapsedRealtime() - pluggedAt < 1500
-                    ? "读取标定数据" : "图像已连接 · 无温度数据";
-            setText(status, message);
+            String state;
+            if (recording) state = mapRate.isEmpty() ? "正在录像" : "录像 · " + mapRate;
+            else if (capturingFullFrame) state = "正在读取全图…";
+            else if (viewingSnapshot) state = thermal.capture().source()
+                    + (snapshotReadMs > 0 ? " · " + snapshotReadMs + " ms" : "");
+            else if (paused) state = "已定格 · " + thermal.capture().source();
+            else state = thermal.capture() == null ? "读取画面" : thermal.capture().source();
+            label(status, state);
         }
-        showValue(hot, shown ? frame.maximum : Float.NaN);
-        showValue(cold, shown ? frame.minimum : Float.NaN);
-        showValue(average, shown ? frame.average : Float.NaN);
-        setText(spot, shown ? thermal.spotDisplay() : "—");
-        button(laserButton, "激光", streaming && !laserBusy, laser);
-        button(photoButton, "拍照", streaming, false);
-        int videoIcon = recording ? R.drawable.ic_square : R.drawable.ic_video;
-        if (!(videoButton.getTag() instanceof Integer) || (int) videoButton.getTag() != videoIcon) {
-            videoButton.setIconResource(videoIcon);
-            videoButton.setTag(videoIcon);
+        label(fps, streaming && !viewingSnapshot && !paused && thermal.fps() > 0
+                ? thermal.fps() + " fps" : "");
+        boolean mapAvailable = CameraController.supportsFullFrame(selected);
+        photoButton.setEnabled(frame != null && !capturingFullFrame && !recordingStarting
+                && !(recording && mapAvailable && !frame.hasPixelTemperatures()));
+        videoButton.setEnabled(recording || (streaming && !paused && !viewingSnapshot && !capturingFullFrame
+                && !recordingStarting && (mapAvailable || (frame != null && frame.hasPixelTemperatures()))));
+        if (videoButton.isSelected() != recording) {
+            videoButton.setSelected(recording);
+            videoButton.setIconResource(recording ? R.drawable.ic_square : R.drawable.ic_video);
         }
-        button(videoButton, recording ? "停止" : "录像",
-                streaming && !recordingStarting && !capturingFullFrame && !viewingSnapshot, recording);
-        button(measurementButton, "测温", true, measuring);
-        button(paletteButton, ThermalView.PALETTE_NAMES[palette], true, false);
-        button(emissivityButton, "ε " + emissivity, true, false);
-        button(calibrationButton, Float.isFinite(lowCalibrationReading) ? "校准高点" : "校准",
-                shown, calibration.applied);
-        button(fullFrameButton, viewingSnapshot ? "实时" : "全图",
-                viewingSnapshot || (streaming && !capturingFullFrame && !recording
-                        && !recordingStarting && CameraController.supportsFullFrame(selected)),
-                viewingSnapshot);
-    }
+        label(videoButton, recording ? "停止" : "录像");
+        galleryButton.setEnabled(!recording && !recordingStarting && !capturingFullFrame);
+        pauseButton.setEnabled(frame != null && !recording && !recordingStarting && !capturingFullFrame);
+        pauseButton.setSelected(paused || viewingSnapshot);
+        label(pauseButton, paused || viewingSnapshot ? "实时" : "定格");
+        shutterButton.setEnabled(streaming && mapAvailable && !shutterBusy);
+        fullFrameButton.setEnabled(streaming && !capturingFullFrame && !recording && !recordingStarting
+                && (mapAvailable || (valid && frame.hasPixelTemperatures())));
+        fullFrameButton.setSelected(viewingSnapshot);
+        label(fullFrameButton, viewingSnapshot ? (previousStill == null ? "返回实时" : "返回定格")
+                : paused && mapAvailable && !frame.hasPixelTemperatures() ? "新拍全图" : "全图");
 
-    private void showValue(TextView view, float celsius) {
-        setText(view, Float.isFinite(celsius)
-                ? ThermalView.number(calibration.apply(celsius)) + " °C" : "—");
-    }
-
-    private static void setText(TextView view, String value) {
-        if (!value.contentEquals(view.getText())) view.setText(value);
-    }
-
-    private void button(MaterialButton view, String label, boolean enabled, boolean active) {
-        if (!label.contentEquals(view.getText())) {
-            view.setText(label);
-            if (Build.VERSION.SDK_INT >= 26) view.setTooltipText(label);
-        }
-        if (view.isEnabled() != enabled) view.setEnabled(enabled);
-        if (view.isSelected() != active) view.setSelected(active);
-    }
-
-    private TextView metric(LinearLayout row, String label, int color) {
-        LinearLayout column = new LinearLayout(this);
-        column.setOrientation(LinearLayout.VERTICAL);
-        column.setGravity(Gravity.CENTER);
-        column.setPadding(dp(3), dp(2), dp(3), dp(2));
-        column.setMinimumHeight(dp(44));
-        TextView name = text(label, 11, MUTED);
-        name.setGravity(Gravity.CENTER);
-        TextView value = new AppCompatTextView(this);
-        value.setText("—");
-        value.setTextSize(16);
-        value.setTextColor(color);
-        value.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        value.setGravity(Gravity.CENTER);
-        value.setSingleLine();
-        value.setHorizontallyScrolling(false);
-        int largest = Math.round(value.getTextSize());
-        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(value,
-                Math.min(dp(9), largest - 1), largest, 1, TypedValue.COMPLEX_UNIT_PX);
-        column.addView(name, new LinearLayout.LayoutParams(-1, -2));
-        column.addView(value, new LinearLayout.LayoutParams(-1, dp(25)));
-        row.addView(column, new LinearLayout.LayoutParams(0, -1, 1));
-        return value;
-    }
-
-    private LinearLayout controlGroup() {
-        LinearLayout group = new LinearLayout(this);
-        group.setBaselineAligned(false);
-        group.setPadding(dp(5), 0, dp(5), 0);
-        toolsPanel.addView(group, new LinearLayout.LayoutParams(-1, -2));
-        return group;
-    }
-
-    private LinearLayout controlPair(LinearLayout group) {
-        LinearLayout pair = horizontal();
-        pair.setBaselineAligned(false);
-        group.addView(pair);
-        return pair;
-    }
-
-    private void layoutControls(LinearLayout group, boolean singleRow) {
-        group.setOrientation(singleRow ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-        for (int i = 0; i < group.getChildCount(); i++) {
-            group.getChildAt(i).setLayoutParams(singleRow ? new LinearLayout.LayoutParams(0, -1, 1)
-                    : new LinearLayout.LayoutParams(-1, -2));
-        }
-    }
-
-    private MaterialButton control(LinearLayout group, String label, int icon, Runnable action) {
-        MaterialButton button = new MaterialButton(this, null,
-                com.google.android.material.R.attr.materialButtonOutlinedStyle);
-        button.setText(label);
-        button.setTextSize(12);
-        button.setGravity(Gravity.CENTER);
-        button.setAllCaps(false);
-        button.setLetterSpacing(0);
-        button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        button.setMinWidth(0);
-        button.setMinimumWidth(0);
-        button.setMinHeight(dp(48));
-        button.setPadding(dp(4), dp(6), dp(4), dp(6));
-        button.setInsetTop(0);
-        button.setInsetBottom(0);
-        button.setCornerRadius(0);
-        button.setStrokeWidth(0);
-        button.setIconResource(icon);
-        button.setIconSize(dp(16));
-        button.setIconPadding(dp(4));
-        button.setIconGravity(MaterialButton.ICON_GRAVITY_TEXT_START);
-        if (Build.VERSION.SDK_INT >= 26) button.setTooltipText(label);
-        ColorStateList foreground = new ColorStateList(new int[][]{
-                {-android.R.attr.state_enabled}, {android.R.attr.state_selected}, {}
-        }, new int[]{0xff828282, BG, TEXT});
-        button.setTextColor(foreground);
-        button.setIconTint(foreground);
-        button.setBackgroundTintList(new ColorStateList(
-                new int[][]{{android.R.attr.state_selected}, {}}, new int[]{0xffdedede, PANEL}));
-        button.setOnClickListener(view -> action.run());
-        LinearLayout.LayoutParams width = new LinearLayout.LayoutParams(0, -1, 1);
-        width.setMargins(dp(2), dp(2), dp(2), dp(2));
-        group.addView(button, width);
-        return button;
-    }
-
-    private TextView text(String text, int sp, int color) {
-        TextView view = new TextView(this);
-        view.setText(text);
-        view.setTextSize(sp);
-        view.setTextColor(color);
-        return view;
-    }
-
-    private LinearLayout horizontal() {
-        LinearLayout row = new LinearLayout(this);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        return row;
+        if (alarms.state == 0 && alarmBanner.getVisibility() != View.GONE) alarmBanner.setVisibility(View.GONE);
     }
 
     private int dp(int value) {

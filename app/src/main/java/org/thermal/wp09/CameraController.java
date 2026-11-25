@@ -9,12 +9,15 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 
+import java.util.ArrayList;
 import java.util.function.Consumer;
 
 final class CameraController {
     private final UsbManager usb;
     private final HandlerThread thread = new HandlerThread("WP09 USB");
     private final Handler worker;
+    private final HandlerThread previewThread = new HandlerThread("WP09 preview");
+    private final Handler previewWorker;
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile Session current;
     private volatile float emissivity = 0.98f;
@@ -24,6 +27,8 @@ final class CameraController {
         this.usb = usb;
         thread.start();
         worker = new Handler(thread.getLooper());
+        previewThread.start();
+        previewWorker = new Handler(previewThread.getLooper());
     }
 
     void start(UsbDevice device, Consumer<ThermalFrame> onFrame, Consumer<String> onError) {
@@ -57,18 +62,56 @@ final class CameraController {
     }
 
     void captureFullFrame(Consumer<ThermalFrame> callback) {
+        captureMaps(false, frames -> callback.accept(frames.length == 0 ? null : frames[frames.length - 1]));
+    }
+
+    void captureMaps(boolean burst, Consumer<ThermalFrame[]> callback) {
         Session session = current;
+        if (session == null || !supportsFullFrame(session.device)) {
+            callback.accept(new ThermalFrame[0]);
+            return;
+        }
+        int generation = session.movieGeneration;
+        float captureEmissivity = emissivity;
         worker.post(() -> {
-            if (session == null || current != session || session.handle == 0
-                    || !supportsFullFrame(session.device)) return;
-            byte[] reference = new byte[ThermalFrame.BYTES];
-            byte[] dump = Wp09Usb.captureRawDump(session.handle, reference);
-            ThermalFrame frame = dump == null ? null
-                    : session.decoder.decodeSnapshot(dump, 7, reference, emissivity);
-            session.lastReceived = SystemClock.elapsedRealtime();
+            if (current != session || session.handle == 0) return;
+            ArrayList<ThermalFrame> frames = new ArrayList<>(8);
+            session.capturing = true;
+            try {
+                synchronized (session.readLock) {
+                    session.readingThermal = session.identifiedThermalOutput && generation == session.movieGeneration;
+                }
+                if (session.readingThermal) session.readThermal(frames, burst, captureEmissivity, generation);
+            } finally {
+                if (!burst || frames.isEmpty() || generation != session.movieGeneration) session.readingThermal = false;
+                session.capturing = false;
+            }
             main.post(() -> {
-                if (current == session) callback.accept(frame);
+                if (current == session) callback.accept(frames.toArray(new ThermalFrame[0]));
             });
+        });
+    }
+
+    void endMapVideo() {
+        Session session = current;
+        if (session == null) return;
+        session.movieGeneration++;
+        worker.post(() -> session.readingThermal = false);
+    }
+
+    void triggerShutter(Consumer<Boolean> callback) {
+        Session session = current;
+        if (session == null || !supportsFullFrame(session.device)) {
+            callback.accept(false);
+            return;
+        }
+        worker.post(() -> {
+            if (current != session || session.handle == 0) return;
+            int result;
+            synchronized (session.readLock) {
+                result = Wp09Usb.triggerShutter(session.handle);
+            }
+            main.post(() -> { if (current == session) callback.accept(result == 0); });
         });
     }
 
@@ -95,6 +138,7 @@ final class CameraController {
 
     void destroy() {
         stop();
+        previewThread.quitSafely();
         thread.quitSafely();
     }
 
@@ -103,15 +147,27 @@ final class CameraController {
         private final Consumer<ThermalFrame> onFrame;
         private final Consumer<String> onError;
         private final byte[] bytes = new byte[ThermalFrame.BYTES];
+        private final byte[] thermalBytes = new byte[ThermalFrame.BYTES];
         private final ThermalFrame.Decoder decoder = new ThermalFrame.Decoder();
+        private final ThermalFrame.Decoder snapshotDecoder = new ThermalFrame.Decoder();
+        private final Object readLock = new Object();
+        private volatile boolean capturing;
+        private volatile boolean readingThermal;
+        private volatile int movieGeneration;
+        private final boolean xwild;
+        private BlindPixels defects;
+        private boolean identifiedThermalOutput;
+        private ThermalFrame recentPreview;
         private UsbDeviceConnection connection;
         private long handle;
-        private long lastReceived;
-        private boolean delivering;
-        private int unexpectedFrameBytes;
+        private volatile long lastReceived;
+        private ThermalFrame pending;
+        private final Runnable deliver = this::deliverLatest;
+        private volatile int unexpectedFrameBytes;
 
         Session(UsbDevice device, Consumer<ThermalFrame> onFrame, Consumer<String> onError) {
             this.device = device;
+            xwild = supportsFullFrame(device);
             this.onFrame = onFrame;
             this.onError = onError;
         }
@@ -136,40 +192,116 @@ final class CameraController {
                     return;
                 }
                 handle = outputHandle[0];
+                // A previous client may have left the device in thermal or raw output mode.
+                if (xwild) {
+                    if (!Wp09Usb.setThermalOutput(handle, false)) {
+                        fail("无法读取固件测温参考");
+                        return;
+                    }
+                    // Each open has its own USB request queue. UVC owns the first connection.
+                    UsbDeviceConnection capture = null;
+                    try {
+                        capture = usb.openDevice(device);
+                        if (capture != null) Wp09Usb.attachCaptureFd(handle, capture.getFileDescriptor());
+                    } catch (RuntimeException error) {
+                        Log.i("WP09", "Using the existing HID connection", error);
+                    } finally {
+                        if (capture != null) capture.close();
+                    }
+                    defects = BlindPixels.fromFactory(Wp09Usb.factoryKb(handle));
+                }
                 lastReceived = SystemClock.elapsedRealtime();
-                worker.post(this::poll);
+                previewWorker.post(this::poll);
             } catch (RuntimeException | LinkageError error) {
                 Log.e("WP09", "USB open", error);
                 fail("无法启动 USB 热成像");
             }
         }
 
+        void readThermal(ArrayList<ThermalFrame> frames, boolean burst, float captureEmissivity, int generation) {
+            // A shutter correction can briefly pause exposures. Keep the recording open through that gap.
+            long deadline = SystemClock.elapsedRealtime() + 5000;
+            while (current == this && generation == movieGeneration && SystemClock.elapsedRealtime() < deadline) {
+                long stamp = Wp09Usb.read(handle, thermalBytes);
+                if (stamp <= 0) continue;
+                ThermalFrame frame = snapshotDecoder.decodeThermalOutput(thermalBytes, captureEmissivity, stamp, defects);
+                if (frame == null) continue;
+                lastReceived = SystemClock.elapsedRealtime();
+                if (frames.isEmpty()) deadline = lastReceived + 1000;
+                frames.add(frame);
+                if (burst && generation == movieGeneration) present(frame);
+                if (!burst || frames.size() == 8) break;
+            }
+        }
+
+        // The first monochrome exposure is used internally to identify the factory thermal stream.
+        // Once identified, preview and recording keep the device in the same UVC mode.
+        private ThermalFrame liveFrame(long stamp) {
+            if (!xwild) {
+                ThermalFrame frame = decoder.decode(bytes, emissivity, stamp);
+                return frame.hasPixelTemperatures() ? frame : ThermalFrame.Decoder.imageOnly(frame.preview, stamp);
+            }
+            if (identifiedThermalOutput)
+                return decoder.decodeThermalOutput(bytes, emissivity, stamp, defects);
+            if (recentPreview == null) {
+                ThermalFrame ref = decoder.decode(bytes, emissivity, stamp);
+                if (!ref.hasPixelTemperatures() && ref.hasTemperature() && Wp09Usb.setThermalOutput(handle, true))
+                    recentPreview = ref;
+                return null;
+            }
+            if (stamp - recentPreview.capturedNanos > 900_000_000L) {
+                Wp09Usb.setThermalOutput(handle, false);
+                recentPreview = null;
+                return null;
+            }
+            ThermalFrame first = decoder.decodeThermalOutput(bytes, emissivity, stamp, defects);
+            if (first == null || !first.agreesWithPreview(recentPreview)) return null;
+            identifiedThermalOutput = true;
+            recentPreview = null;
+            return first;
+        }
+
         void poll() {
-            if (current != this) return;
-            int count = Wp09Usb.read(handle, bytes);
-            long now = SystemClock.elapsedRealtime();
-            if (count < 0) unexpectedFrameBytes = -count;
-            if (count == bytes.length) {
-                lastReceived = now;
-                synchronized (this) {
-                    if (!delivering) {
-                        ThermalFrame frame = decoder.decode(bytes, emissivity);
-                        delivering = true;
-                        main.post(() -> {
-                            try {
-                                if (current == this) onFrame.accept(frame);
-                            } finally {
-                                synchronized (this) { delivering = false; }
-                            }
-                        });
-                    }
+            ThermalFrame decoded = null;
+            synchronized (readLock) {
+                if (current != this || handle == 0) return;
+                if (readingThermal) {
+                    previewWorker.postDelayed(this::poll, 12);
+                    return;
                 }
-            } else if (now - lastReceived > 4000) {
-                fail(unexpectedFrameBytes == 0 ? "WP-09 未传输画面，请重新插入设备"
-                        : "设备返回了未识别的帧格式（" + unexpectedFrameBytes + " 字节）");
+                long stamp = Wp09Usb.read(handle, bytes);
+                if (stamp < 0) unexpectedFrameBytes = (int) -stamp;
+                if (stamp > 0) decoded = liveFrame(stamp);
+            }
+            long now = SystemClock.elapsedRealtime();
+            if (decoded != null) {
+                lastReceived = now;
+                present(decoded);
+            } else if (!capturing && now - lastReceived > 5000) {
+                worker.post(() -> {
+                    if (current == this) fail(xwild ? "未收到可校验的全图测温数据，点连接状态重试"
+                            : unexpectedFrameBytes == 0 ? "WP-09 未传输画面，请重新插入设备"
+                            : "设备返回了未识别的帧格式（" + unexpectedFrameBytes + " 字节）");
+                });
                 return;
             }
-            worker.postDelayed(this::poll, 32);
+            previewWorker.post(this::poll);
+        }
+
+        private synchronized void present(ThermalFrame decoded) {
+            if (pending != null && pending.capturedNanos >= decoded.capturedNanos) return;
+            boolean schedule = pending == null;
+            pending = decoded;
+            if (schedule) main.post(deliver);
+        }
+
+        private void deliverLatest() {
+            ThermalFrame next;
+            synchronized (this) {
+                next = pending;
+                pending = null;
+            }
+            if (current == this) onFrame.accept(next);
         }
 
         void fail(String message) {
@@ -185,13 +317,17 @@ final class CameraController {
 
         UsbSample sample(String status) {
             byte[] raw = handle == 0 ? null : Wp09Usb.sample(handle);
-            return new UsbSample(device, raw, unexpectedFrameBytes, status);
+            UsbSample sample = new UsbSample(device, raw, unexpectedFrameBytes, status);
+            if (handle != 0 && supportsFullFrame(device)) sample.setCaptureReader(Wp09Usb.queuedCapture(handle));
+            return sample;
         }
 
         void close() {
-            if (handle != 0) {
-                Wp09Usb.close(handle);
-                handle = 0;
+            synchronized (readLock) {
+                if (handle != 0) {
+                    Wp09Usb.close(handle);
+                    handle = 0;
+                }
             }
             if (connection != null) {
                 connection.close();

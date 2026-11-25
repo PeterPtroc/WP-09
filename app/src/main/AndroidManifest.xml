@@ -6,7 +6,12 @@
         android:icon="@drawable/ic_thermal"
         android:label="WP-09 热成像"
         android:theme="@style/Theme.Wp09">
+        <activity android:name=".ReviewActivity" android:exported="false"
+            android:screenOrientation="sensorLandscape" />
+        <activity android:name=".GalleryActivity" android:exported="false"
+            android:screenOrientation="sensorLandscape" />
         <activity android:name=".MainActivity" android:exported="true"
+            android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

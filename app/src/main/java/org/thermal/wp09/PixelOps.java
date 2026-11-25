@@ -14,7 +14,8 @@ final class PixelOps {
                                           float scale, float offset, float low, float high);
     static native void renderBrightness(byte[] luma, int[] lut, int[] dest, int firstColumn, int sourceShift);
     static native float[] displayBias(float[][] samples, byte[][] pairedLuma, int firstColumn);
-    static native void renderMobile(float[] readings, int firstColumn, float[] bias, int[] lut, int[] dest);
+    static native void renderMobile(float[] readings, int firstColumn, boolean thermalOutput, float[] bias,
+                                   int[] lut, int[] dest);
     static native boolean yuv(int[] pixels, ByteBuffer y, int yOffset, int yStride, int yStep,
                               ByteBuffer u, int uOffset, int uStride, int uStep,
                               ByteBuffer v, int vOffset, int vStride, int vStep);

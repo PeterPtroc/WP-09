@@ -107,11 +107,14 @@ final class CameraController {
         }
         worker.post(() -> {
             if (current != session || session.handle == 0) return;
-            int result;
             synchronized (session.readLock) {
-                result = Wp09Usb.triggerShutter(session.handle);
+                if (!session.shutter.holding() && Wp09Usb.triggerShutter(session.handle) == 0) {
+                    session.shutterSettled = callback;
+                    session.beginShutter(System.nanoTime(), true);
+                    return;
+                }
             }
-            main.post(() -> { if (current == session) callback.accept(result == 0); });
+            main.post(() -> { if (current == session) callback.accept(false); });
         });
     }
 
@@ -150,6 +153,8 @@ final class CameraController {
         private final byte[] thermalBytes = new byte[ThermalFrame.BYTES];
         private final ThermalFrame.Decoder decoder = new ThermalFrame.Decoder();
         private final ThermalFrame.Decoder snapshotDecoder = new ThermalFrame.Decoder();
+        private final ShutterGate shutter = new ShutterGate();
+        private Consumer<Boolean> shutterSettled;
         private final Object readLock = new Object();
         private volatile boolean capturing;
         private volatile boolean readingThermal;
@@ -158,6 +163,7 @@ final class CameraController {
         private BlindPixels defects;
         private boolean identifiedThermalOutput;
         private ThermalFrame recentPreview;
+        private long retryPreviewAt;
         private UsbDeviceConnection connection;
         private long handle;
         private volatile long lastReceived;
@@ -224,7 +230,8 @@ final class CameraController {
             while (current == this && generation == movieGeneration && SystemClock.elapsedRealtime() < deadline) {
                 long stamp = Wp09Usb.read(handle, thermalBytes);
                 if (stamp <= 0) continue;
-                ThermalFrame frame = snapshotDecoder.decodeThermalOutput(thermalBytes, captureEmissivity, stamp, defects);
+                ThermalFrame frame = thermalFrame(snapshotDecoder, thermalBytes, captureEmissivity, stamp);
+                if (shutter.holding() && !frames.isEmpty()) break;
                 if (frame == null) continue;
                 lastReceived = SystemClock.elapsedRealtime();
                 if (frames.isEmpty()) deadline = lastReceived + 1000;
@@ -234,31 +241,57 @@ final class CameraController {
             }
         }
 
-        // The first monochrome exposure is used internally to identify the factory thermal stream.
-        // Once identified, preview and recording keep the device in the same UVC mode.
-        private ThermalFrame liveFrame(long stamp) {
-            if (!xwild) {
-                ThermalFrame frame = decoder.decode(bytes, emissivity, stamp);
-                return frame.hasPixelTemperatures() ? frame : ThermalFrame.Decoder.imageOnly(frame.preview, stamp);
+        private void beginShutter(long stamp, boolean commanded) {
+            shutter.start(stamp, commanded);
+            selectPreview(stamp);
+        }
+
+        private void selectPreview(long stamp) {
+            recentPreview = null;
+            retryPreviewAt = Wp09Usb.setThermalOutput(handle, false) ? 0 : stamp + 150_000_000L;
+        }
+
+        // On connection and after shutter closure, use the firmware's processed
+        // channel as a reference. Only verified full temperature planes leave here.
+        private ThermalFrame thermalFrame(ThermalFrame.Decoder reader, byte[] wire, float emiss, long stamp) {
+            if (identifiedThermalOutput && !shutter.holding()) {
+                ThermalFrame frame = reader.decodeThermalOutput(wire, emiss, stamp, defects);
+                if (frame == null || !shutter.suspect(frame, wire)) return frame;
+                beginShutter(stamp, false);
+                return null;
             }
-            if (identifiedThermalOutput)
-                return decoder.decodeThermalOutput(bytes, emissivity, stamp, defects);
+            if (retryPreviewAt != 0) {
+                if (stamp >= retryPreviewAt) selectPreview(stamp);
+                return null;
+            }
             if (recentPreview == null) {
-                ThermalFrame ref = decoder.decode(bytes, emissivity, stamp);
-                if (!ref.hasPixelTemperatures() && ref.hasTemperature() && Wp09Usb.setThermalOutput(handle, true))
+                ThermalFrame ref = reader.decode(wire, emiss, stamp);
+                if (!ref.hasPixelTemperatures() && ref.hasTemperature() && shutter.referenceReady(stamp)
+                        && Wp09Usb.setThermalOutput(handle, true))
                     recentPreview = ref;
                 return null;
             }
             if (stamp - recentPreview.capturedNanos > 900_000_000L) {
-                Wp09Usb.setThermalOutput(handle, false);
-                recentPreview = null;
+                selectPreview(stamp);
                 return null;
             }
-            ThermalFrame first = decoder.decodeThermalOutput(bytes, emissivity, stamp, defects);
+            ThermalFrame first = reader.decodeThermalOutput(wire, emiss, stamp, defects);
             if (first == null || !first.agreesWithPreview(recentPreview)) return null;
+            shutter.verified(first);
             identifiedThermalOutput = true;
             recentPreview = null;
+            if (shutterSettled != null) {
+                Consumer<Boolean> done = shutterSettled;
+                shutterSettled = null;
+                main.post(() -> { if (current == this) done.accept(true); });
+            }
             return first;
+        }
+
+        private ThermalFrame liveFrame(long stamp) {
+            if (xwild) return thermalFrame(decoder, bytes, emissivity, stamp);
+            ThermalFrame frame = decoder.decode(bytes, emissivity, stamp);
+            return frame.hasPixelTemperatures() ? frame : ThermalFrame.Decoder.imageOnly(frame.preview, stamp);
         }
 
         void poll() {

@@ -49,8 +49,7 @@ final class ThermalVideo implements Closeable {
             muxer = new MediaMuxer(video.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
             MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT);
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
-            // Full maps are encoded on a temporary 50 Hz clock before uniform remuxing.
-            // Give each of these exposures sufficient bits for fine temperature gradients.
+            // Give full maps sufficient bits for fine temperature gradients.
             codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
             int bitRate = codec.getCodecInfo().getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
                     .getVideoCapabilities().getBitrateRange().clamp(fullMaps ? 6_000_000 : 2_000_000);
@@ -74,12 +73,14 @@ final class ThermalVideo implements Closeable {
     }
 
     void offer(ThermalCapture frame, long timeNs, boolean fromBurst) throws IOException {
+        if (frame.frame.thermalOutput && !archive.uniform) {
+            // Every direct exposure has its own UVC clock. Gaps hold the preceding
+            // AVC picture and its measurement index for exactly the same interval.
+            encode(frame, timeNs, false);
+            return;
+        }
         if (fromBurst) {
             archive.uniform = true;
-            if (frame.frame.thermalOutput && warmup.isEmpty()) {
-                encode(frame, timeNs, true);
-                return;
-            }
             if (movieImage == null) {
                 warmup.add(new PendingFrame(frame, timeNs));
                 if (warmup.size() == MobileImage.WINDOW) encodeWarmup();

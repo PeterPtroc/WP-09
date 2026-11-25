@@ -64,7 +64,7 @@ public final class MainActivity extends AppCompatActivity {
     private boolean capturingFullFrame;
     private boolean viewingSnapshot;
     private boolean measuring = true;
-    private boolean paused, pullingVideoMaps;
+    private boolean paused, pullingVideoMaps, readingVideoBatch;
     private long lastPanelAt, mapRateStartNs, snapshotReadMs;
     private int mapsReceived, pendingVideoBatches;
     private String mapRate = "";
@@ -248,7 +248,7 @@ public final class MainActivity extends AppCompatActivity {
         render();
         camera.triggerShutter(ok -> {
             shutterBusy = false;
-            message(ok ? "已触发快门校准" : "快门校准指令未确认");
+            if (!ok) message("快门校准指令未确认");
             render();
         });
     }
@@ -430,10 +430,12 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void takePhoto() {
-        if (frame == null || capturingFullFrame) return;
-        if (!paused && !frame.hasPixelTemperatures() && CameraController.supportsFullFrame(selected)) {
+        ThermalCapture visible = thermal.drawnCapture();
+        if (visible == null || capturingFullFrame || recordingStarting) return;
+        if (!paused && !visible.frame.hasPixelTemperatures() && CameraController.supportsFullFrame(selected)) {
+            if (recording) return;
             captureMap(true);
-        } else media.photo(thermal.capture());
+        } else media.photo(visible, !recording);
     }
 
     private void captureMap(boolean save) {
@@ -563,12 +565,12 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void nextVideoMap(int request) {
-        if (request != recordingRequest || !recording || capturingFullFrame || pendingVideoBatches >= 2) return;
-        capturingFullFrame = true;
+        if (request != recordingRequest || !recording || readingVideoBatch || pendingVideoBatches >= 2) return;
+        readingVideoBatch = true;
         Calibration correction = calibration;
         camera.captureMaps(true, frames -> {
-            capturingFullFrame = false;
-            if (request != recordingRequest || !recording) { render(); return; }
+            if (request != recordingRequest || !recording) return;
+            readingVideoBatch = false;
             if (frames.length == 0) {
                 stopVideo();
                 message("全图取样中断");
@@ -612,7 +614,7 @@ public final class MainActivity extends AppCompatActivity {
         if (pullingVideoMaps) camera.endMapVideo();
         if (recording || recordingStarting) media.stop();
         if (recording && pullingVideoMaps) frame = liveFrame;
-        recording = recordingStarting = pullingVideoMaps = false;
+        recording = recordingStarting = pullingVideoMaps = readingVideoBatch = false;
     }
 
     private void choosePalette() {
@@ -753,7 +755,8 @@ public final class MainActivity extends AppCompatActivity {
         boolean valid = frame != null && frame.hasTemperature();
         if (streaming) {
             String state;
-            if (recording) state = mapRate.isEmpty() ? "正在录像" : "录像 · " + mapRate;
+            if (shutterBusy) state = recording ? "录像 · 快门校准中" : "快门校准中";
+            else if (recording) state = mapRate.isEmpty() ? "正在录像" : "录像 · " + mapRate;
             else if (capturingFullFrame) state = "正在读取全图…";
             else if (viewingSnapshot) state = thermal.capture().source()
                     + (snapshotReadMs > 0 ? " · " + snapshotReadMs + " ms" : "");

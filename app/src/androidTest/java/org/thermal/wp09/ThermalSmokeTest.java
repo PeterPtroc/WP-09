@@ -118,6 +118,7 @@ public final class ThermalSmokeTest extends Instrumentation {
         check(Float.isFinite(changed) && Math.abs(changed - frame.average) > 0.01f, "Emissivity");
         check(!decoder.decode(new byte[ThermalFrame.BYTES], 0.98f).hasTemperature(), "Image-only stream");
         checkThermalOutput(decoder, wire, preview, summary);
+        checkShutterGate(decoder, wire);
         Calibration calibration = Calibration.twoPoint(20, 24, 50, 57);
         check(Math.abs(calibration.apply(35) - 40.5f) < 0.01f, "Two-point calibration");
 
@@ -278,6 +279,55 @@ public final class ThermalSmokeTest extends Instrumentation {
         report.append("49,152 synthetic thermal-output sites, bad-site repair and stale telemetry checked. ");
     }
 
+    private void checkShutterGate(ThermalFrame.Decoder decoder, byte[] wire) throws Exception {
+        ShutterGate gate = new ShutterGate();
+        BlindPixels defects = BlindPixels.fromFactory(new byte[ThermalFrame.PIXELS * 4]);
+        ThermalFrame scene = decoder.decodeThermalOutput(wire, .98f, 0, defects);
+        gate.verified(scene);
+        byte[] closed = wire.clone();
+        ByteBuffer words = ByteBuffer.wrap(closed).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < ThermalFrame.PIXELS; i++) words.putShort(i * 2, (short) 7100);
+        ThermalFrame flat = decoder.decodeThermalOutput(closed, .98f, 20_000_000L, defects);
+        check(gate.suspect(flat, closed), "A shutter plane with stale scene telemetry needs a firmware reference");
+        int trailer = ThermalFrame.PIXELS * 2;
+        for (int pos : new int[]{4, 6, 10, 12}) words.putShort(trailer + pos, (short) 0);
+        for (int pos : new int[]{8, 14, 24}) words.putShort(trailer + pos, (short) 7100);
+        check(!gate.suspect(flat, closed), "A confirmed flat wall is a legitimate live image");
+        Arrays.fill(closed, 0, trailer, (byte) 0);
+        check(decoder.decodeThermalOutput(closed, .98f, 1, defects) == null, "Reject blank disabled output");
+        gate.start(0, true);
+        for (long t = 0; t <= 120_000_000L; t += 20_000_000L)
+            check(!gate.referenceReady(t), "Queued exposures cannot complete a manual shutter command");
+        check(!gate.referenceReady(600_000_000L), "Allow the reopened shutter to settle");
+        for (long t = 620_000_000L; t < 700_000_000L; t += 20_000_000L)
+            check(!gate.referenceReady(t), "Withhold settling frames");
+        check(gate.referenceReady(700_000_000L) && gate.holding(), "Require a matching thermal frame after reference");
+        gate.verified(scene);
+        check(!gate.holding(), "Reopen the verified stream");
+
+        File movie = new File(getTargetContext().getCacheDir(), "wp09-shutter-gap.mp4");
+        long[] times = {0, 20_000, 40_000, 780_000, 800_000};
+        try {
+            try (ThermalVideo video = new ThermalVideo(movie.getParentFile(), true)) {
+                for (long t : times)
+                    video.offer(new ThermalCapture(scene, Calibration.DEFAULT, 0, Float.NaN, Float.NaN), t * 1000, true);
+                video.finish(1_300_000_000L);
+                try (FileOutputStream out = new FileOutputStream(movie)) { video.writeTo(out); }
+            }
+            try (MovieArchive.Reader video = new MovieArchive.Reader(getTargetContext().getContentResolver()
+                    .openAssetFileDescriptor(Uri.fromFile(movie), "r"))) {
+                check(video.size() == 5 && video.atPlayTime(770_000) == 2 && video.atPlayTime(790_000) == 3,
+                        "AVC and album hold the last real measurement for the shutter gap");
+                check(Math.abs(video.durationUs - 1_300_000) < 1000 && video.atPlayTime(1_250_000) == 4,
+                        "Stopping during calibration retains the trailing hold");
+                for (int i = 0; i < times.length; i++)
+                    check(Math.abs(video.timeUs(i) - times[i]) < 1000 && video.captureUs(i) == times[i],
+                            "Direct stream preserves independent exposure timestamps");
+            }
+        } finally { movie.delete(); }
+        report.append("Shutter screening, real flat fields, settling and AVC gap holds checked. ");
+    }
+
     private void checkNewFieldFiles() throws Exception {
         File dir = getTargetContext().getCacheDir();
         File still = new File(dir, "field-hand.png"), movie = new File(dir, "field-hand.mp4");
@@ -406,7 +456,7 @@ public final class ThermalSmokeTest extends Instrumentation {
         MobileImage stationary = MobileImage.fromStart(32, i -> f);
         check(stationary.bias == null, "A stationary scene cannot become a noise reference");
         ThermalFrame paired = new ThermalFrame(f.readings, preview.preview, f.cold, f.hot, f.minimum, f.maximum,
-                f.center, f.average);
+                f.center, f.average, f.capturedNanos, null, f.firstColumn, f.thermalOutput);
         int[] a = new int[ThermalFrame.PIXELS], b = a.clone(), lut = new int[256];
         for (boolean locked : new boolean[]{false, true}) {
             float low = locked ? cal.apply(f.minimum) : Float.NaN, high = locked ? cal.apply(f.maximum) : Float.NaN;
@@ -844,6 +894,7 @@ public final class ThermalSmokeTest extends Instrumentation {
         try {
             media.photo(photo);
             check("照片已保存".equals(result.poll(10, TimeUnit.SECONDS)), "PNG published");
+            Uri image = latestPhoto();
             LinkedBlockingQueue<Boolean> ready = new LinkedBlockingQueue<>();
             media.start(ready::offer);
             check(Boolean.TRUE.equals(ready.poll(10, TimeUnit.SECONDS)), "Encoder start");
@@ -876,9 +927,11 @@ public final class ThermalSmokeTest extends Instrumentation {
                 lastNs = f.capturedNanos;
                 boolean submit = directReplay && (i % 8 == 7 || i + 1 == n);
                 if (submit) check(batches.tryAcquire(3, TimeUnit.SECONDS), "Map encoder keeps up with capture");
+                boolean concurrentPhoto = directReplay && i % 350 == 60;
                 runOnMainSync(() -> {
                     activity.receive(f);
                     if (directReplay) {
+                        if (concurrentPhoto) media.photo(view.drawnCapture(), false);
                         batch.add(view.capture());
                         if (submit) {
                             media.burst(batch.toArray(new ThermalCapture[0]), ok -> {
@@ -897,7 +950,6 @@ public final class ThermalSmokeTest extends Instrumentation {
             String notice = result.poll(12, TimeUnit.SECONDS);
             check("录像已保存".equals(notice), "MP4 published: " + notice);
             List<CaptureLibrary> files = CaptureLibrary.list(getTargetContext());
-            Uri image = files.stream().filter(e -> !e.movie).findFirst().get().uri;
             Uri movie = files.stream().filter(e -> e.movie).findFirst().get().uri;
             try (InputStream in = getTargetContext().getContentResolver().openInputStream(image)) {
                 ThermalCapture actual = RadiometricPng.read(in);
@@ -916,6 +968,7 @@ public final class ThermalSmokeTest extends Instrumentation {
                                       byte[] wire, ThermalFrame preview) throws Exception {
         if (field(activity, "selected", android.hardware.usb.UsbDevice.class) != null) return;
         Uri before = latestMovie();
+        Uri beforePhoto = latestPhoto();
         View button = field(activity, "videoButton", View.class);
         SystemClock.sleep(140);
         runOnMainSync(() -> {
@@ -932,9 +985,21 @@ public final class ThermalSmokeTest extends Instrumentation {
         while (!field(activity, "recording", Boolean.class) && SystemClock.uptimeMillis() < deadline)
             SystemClock.sleep(20);
         check(field(activity, "recording", Boolean.class), "One tap starts the recorder");
+        ThermalCapture[] drawn = new ThermalCapture[1];
         for (int i = 0; i < 3; i++) {
             SystemClock.sleep(50);
-            runOnMainSync(() -> { activity.receive(preview); activity.receive(decoder.decode(wire, .98f)); });
+            boolean tap = i == 1;
+            runOnMainSync(() -> {
+                activity.receive(preview);
+                if (tap) {
+                    ThermalView view = field(activity, "thermal", ThermalView.class);
+                    drawn[0] = view.drawnCapture();
+                    View photo = field(activity, "photoButton", View.class);
+                    check(photo.isEnabled() && drawn[0].frame.hasPixelTemperatures(), "Still available during recording");
+                    photo.performClick();
+                }
+                activity.receive(decoder.decode(wire, .98f));
+            });
         }
         runOnMainSync(button::performClick);
         deadline = SystemClock.uptimeMillis() + 5000;
@@ -944,6 +1009,13 @@ public final class ThermalSmokeTest extends Instrumentation {
             saved = latestMovie();
         }
         check(saved != null && !saved.equals(before), "Stop publishes the one-tap recording");
+        Uri still = latestPhoto();
+        check(still != null && !still.equals(beforePhoto), "Recording snapshot saved");
+        try (InputStream in = getTargetContext().getContentResolver().openInputStream(still)) {
+            ThermalCapture restored = RadiometricPng.read(in);
+            check(Arrays.equals(restored.frame.readings, drawn[0].frame.readings) && restored.palette == drawn[0].palette,
+                    "Saved the drawn exposure even with a newer preview waiting for vsync");
+        }
         try (MovieArchive.Reader r = new MovieArchive.Reader(getTargetContext().getContentResolver()
                 .openAssetFileDescriptor(saved, "r"))) {
             check(r.size() == 4, "Only the four full-plane arrivals were recorded");
@@ -955,6 +1027,11 @@ public final class ThermalSmokeTest extends Instrumentation {
 
     private Uri latestMovie() {
         return CaptureLibrary.list(getTargetContext()).stream().filter(item -> item.movie)
+                .map(item -> item.uri).findFirst().orElse(null);
+    }
+
+    private Uri latestPhoto() {
+        return CaptureLibrary.list(getTargetContext()).stream().filter(item -> !item.movie)
                 .map(item -> item.uri).findFirst().orElse(null);
     }
 

@@ -95,7 +95,7 @@ final class ThermalFrame {
     boolean agreesWithPreview(ThermalFrame previewFrame) {
         if (!thermalOutput || previewFrame == null || previewFrame.readings != null || !previewFrame.hasTemperature()
                 || previewFrame.hot < 0 || previewFrame.cold < 0) return false;
-        // One-time mode identification against a nearby preview. This tolerance
+        // Mode identification against a nearby preview. This tolerance
         // allows small scene changes; it does not modify any measurement.
         return Math.abs(maximum - previewFrame.maximum) <= 1f && Math.abs(minimum - previewFrame.minimum) <= 1f
                 && Math.abs(center - previewFrame.center) <= 1f
@@ -217,12 +217,14 @@ final class ThermalFrame {
             if (defects != null) defects.correct(frame);
             ThermalFrame result = convert(bytes, 0, WIDTH * Short.BYTES, true, timeNs);
             if (result == null) return null;
+            // Output-disabled UVC packets can carry an all-zero image and an old valid footer.
+            if (result.cold == result.hot && word(frame, result.hot * 2) == 0) return null;
             // Without the device's defect list only accept a plane corroborated by
             // the complete firmware summary, including the two-center AD count.
             return defects != null || (hasTelemetry(frame) && matchesTelemetry(result, frame)) ? result : null;
         }
 
-        private static boolean matchesTelemetry(ThermalFrame result, ByteBuffer frame) {
+        static boolean matchesTelemetry(ThermalFrame result, ByteBuffer frame) {
             return result.hot == pixelIndex(frame, 4) && result.cold == pixelIndex(frame, 10)
                     && word(frame, result.hot * 2) == word(frame, TELEMETRY + 8)
                     && word(frame, result.cold * 2) == word(frame, TELEMETRY + 14)

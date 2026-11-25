@@ -40,7 +40,7 @@ final class ThermalView extends View {
     private Shader gradient;
     private float gradientTop, gradientBottom;
     private Runnable onSelection;
-    private ThermalFrame lastDrawn;
+    private ThermalCapture lastDrawn;
     private long fpsStart;
     private int draws, fps;
 
@@ -56,7 +56,8 @@ final class ThermalView extends View {
 
     void onSpotChanged(Runnable listener) { onSelection = listener; }
     ThermalCapture capture() { return capture; }
-    ThermalFrame drawnFrame() { return lastDrawn; }
+    ThermalFrame drawnFrame() { return lastDrawn == null ? null : lastDrawn.frame; }
+    ThermalCapture drawnCapture() { return lastDrawn; }
     int fps() { return fps; }
 
     void setExtremaVisible(boolean hot, boolean cold) {
@@ -172,7 +173,7 @@ final class ThermalView extends View {
         }
         canvas.restore();
         if (degrees) drawScale(canvas);
-        if (capture.frame != lastDrawn) {
+        if (capture.frame != drawnFrame()) {
             long now = SystemClock.elapsedRealtime();
             if (fpsStart == 0) fpsStart = now;
             draws++;
@@ -181,8 +182,8 @@ final class ThermalView extends View {
                 draws = 0;
                 fpsStart = now;
             }
-            lastDrawn = capture.frame;
         }
+        lastDrawn = capture;
     }
 
     private void drawExtrema(Canvas canvas) {

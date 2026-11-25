@@ -28,6 +28,9 @@ final class ThermalMedia {
     private final Consumer<String> notify;
     private final HandlerThread thread = new HandlerThread("WP09 media");
     private final Handler worker;
+    private final HandlerThread photoThread = new HandlerThread("WP09 photos");
+    private final Handler photoWorker;
+    private final Semaphore photoSlots = new Semaphore(4);
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Semaphore available = new Semaphore(24);
     private ThermalVideo movie;
@@ -37,17 +40,29 @@ final class ThermalMedia {
         this.notify = notify;
         thread.start();
         worker = new Handler(thread.getLooper());
+        photoThread.start();
+        photoWorker = new Handler(photoThread.getLooper());
     }
 
     void photo(ThermalCapture capture) {
+        photo(capture, true);
+    }
+
+    void photo(ThermalCapture capture, boolean showSaved) {
         if (capture == null) return;
-        worker.post(() -> {
+        if (!photoSlots.tryAcquire()) {
+            message("照片正在保存，请稍后再拍");
+            return;
+        }
+        photoWorker.post(() -> {
             try {
                 writeMedia(false, stream -> RadiometricPng.write(stream, capture));
-                saved("照片已保存");
+                saved(showSaved ? "照片已保存" : null);
             } catch (IOException | RuntimeException e) {
                 Log.w("WP09", "Photo", e);
                 message("照片保存失败");
+            } finally {
+                photoSlots.release();
             }
         });
     }
@@ -129,6 +144,7 @@ final class ThermalMedia {
     void destroy() {
         stop();
         thread.quitSafely();
+        photoThread.quitSafely();
     }
 
     private void release() {
@@ -138,7 +154,7 @@ final class ThermalMedia {
 
     private void saved(String text) {
         context.sendBroadcast(new android.content.Intent(SAVED).setPackage(context.getPackageName()));
-        message(text);
+        if (text != null) message(text);
     }
 
     private void message(String text) {

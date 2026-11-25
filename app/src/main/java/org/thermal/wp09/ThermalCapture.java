@@ -58,8 +58,8 @@ final class ThermalCapture {
         if (frame.readings != null && Float.isFinite(low)) {
             PixelOps.renderTemperatures(frame.readings, colors, dest, calibration.scale, calibration.offset, low, high);
         } else if (frame.readings != null && (movieImage != null || frame.preview == null)) {
-            PixelOps.renderMobile(frame.readings, frame.firstColumn, movieImage == null ? null : movieImage.bias,
-                    colors, dest);
+            PixelOps.renderMobile(frame.readings, frame.firstColumn, frame.thermalOutput,
+                    movieImage == null ? null : movieImage.bias, colors, dest);
         } else {
             int[] lut = colors;
             if (Float.isFinite(low) && frame.hasTemperature()) {

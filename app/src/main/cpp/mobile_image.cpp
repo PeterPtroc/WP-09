@@ -193,9 +193,49 @@ void addPairedResidual(int left, const std::array<jbyte, pixels>& luma, const Si
     }
 }
 
-void render(int left, const jint* lut) {
-    ws.index(ws.field, left);
+// Estimate the common offset between adjacent rows across the field. A large step
+// starts a new segment, so the filter never averages across a horizontal object edge.
+void correctRows(int left, float sigma) {
+    if (sigma < .002f) return;
+    const float stepLimit = std::min(.15f, 2.f * sigma);
+    std::array<float, height> level{};
+    std::array<int, height> segment{};
+    std::array<float, width / 4> differences;
+    for (int y = 1; y < height; ++y) {
+        int n = 0;
+        for (int x = left; x < width; x += 4) {
+            int i = y * width + x;
+            float d = ws.field[i] - ws.field[i - width];
+            if (std::isfinite(d)) differences[n++] = d;
+        }
+        bool boundary = n < 16;
+        float step = 0;
+        if (!boundary) {
+            std::nth_element(differences.begin(), differences.begin() + n / 2, differences.begin() + n);
+            step = differences[n / 2];
+            boundary = std::abs(step) > stepLimit;
+        }
+        segment[y] = segment[y - 1] + boundary;
+        level[y] = boundary ? 0 : level[y - 1] + step;
+    }
+    for (int y = 0; y < height; ++y) {
+        float residual = 0;
+        int pairs = 0;
+        for (int d = 1; d <= 4 && y >= d && y + d < height; ++d) {
+            if (segment[y - d] != segment[y + d]) break;
+            residual += 2 * level[y] - level[y - d] - level[y + d];
+            ++pairs;
+        }
+        if (pairs == 0) continue;
+        float bias = std::clamp(residual / (2 * pairs + 1), -sigma, sigma);
+        for (int x = left; x < width; ++x) ws.field[y * width + x] -= bias;
+    }
+}
+
+void render(int left, const jint* lut, bool thermalOutput) {
     float sigma = ws.noise(left);
+    if (thermalOutput) correctRows(left, sigma);
+    ws.index(ws.field, left);
     float preserve = .18f / (.18f + sigma);
     ws.sample.clear();
     for (int y = 0; y < height; ++y) for (int x = left; x < width; ++x) {
@@ -206,6 +246,15 @@ void render(int left, const jint* lut) {
         float edge = std::abs(near - far);
         float keep = (edge + .10f) / (edge + .10f + .27f * sigma);
         float filtered = far + keep * (near + preserve * (center - near) - far);
+        if (thermalOutput) {
+            // Suppress pixel noise on flat surfaces. Keep narrow features whose
+            // contrast exceeds the noise measured in this exposure.
+            float noise = std::max(sigma, .002f);
+            float signal = center - near;
+            float pixelWeight = signal * signal / (signal * signal + 9 * noise * noise);
+            float edgeWeight = edge / (edge + noise);
+            filtered = far + (.30f + .70f * edgeWeight) * (near - far) + pixelWeight * signal;
+        }
         ws.smooth[i] = filtered;
         if (y % 3 == 0 && (x + y / 3) % 4 == 0) ws.sample.push_back(filtered);
     }
@@ -217,7 +266,8 @@ void render(int left, const jint* lut) {
     if (ws.sample.empty()) return;
     int trim = static_cast<int>(ws.sample.size() / 100);
     float low = ws.quantile(trim), high = ws.quantile(static_cast<int>(ws.sample.size()) - 1 - trim);
-    float span = std::max(high - low, 1.f), mid = (low + high) * .5f;
+    float minSpan = thermalOutput ? std::max(1.f, 20 * sigma) : 1.f;
+    float span = std::max(high - low, minSpan), mid = (low + high) * .5f;
     ws.index(ws.smooth, left);
     for (int y = 0; y < height; ++y) for (int x = left; x < width; ++x) {
         int i = y * width + x;
@@ -276,7 +326,7 @@ Java_org_thermal_wp09_PixelOps_displayBias(JNIEnv* env, jclass, jobjectArray sam
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_thermal_wp09_PixelOps_renderMobile(JNIEnv* env, jclass, jfloatArray readings, jint left,
-                                             jfloatArray bias, jintArray palette, jintArray output) {
+                                             jboolean thermalOutput, jfloatArray bias, jintArray palette, jintArray output) {
     std::array<jint, 256> lut;
     env->GetFloatArrayRegion(readings, 0, pixels, ws.field.data());
     env->GetIntArrayRegion(palette, 0, lut.size(), lut.data());
@@ -285,6 +335,6 @@ Java_org_thermal_wp09_PixelOps_renderMobile(JNIEnv* env, jclass, jfloatArray rea
         for (int i = 0; i < pixels; ++i) ws.field[i] -= ws.smooth[i];
     }
     if (env->ExceptionCheck()) return;
-    render(left, lut.data());
+    render(left, lut.data(), thermalOutput);
     env->SetIntArrayRegion(output, 0, pixels, ws.colors.data());
 }

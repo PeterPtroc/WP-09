@@ -29,6 +29,7 @@ final class MovieArchive {
     private static final long PLANE_HIGH = 0x5d099768a2184140L, PLANE_LOW = 0x93bedd598bf84407L;
     private static final long CONTRAST_HIGH = 0x8551eb625aa84ae8L, CONTRAST_LOW = 0xbc84881fea5819a7L;
     private static final long TONE_HIGH = 0x1eb06fb257db4dc6L, TONE_LOW = 0xb205f1bbd371e299L;
+    private static final long IRON_HIGH = 0xb70c50db2ef34194L, IRON_LOW = 0x8b778266a314fa95L;
     private static final int EVENT = Long.BYTES + ThermalPayload.SOURCE_BYTES;
     private static final int VERSION = 1;
 
@@ -36,9 +37,9 @@ final class MovieArchive {
         private final File samples, index;
         private final DataOutputStream data, entries;
         private final ThermalPayload.Encoder encoder = new ThermalPayload.Encoder();
-        private final ByteBuffer event = ByteBuffer.allocate(EVENT);
+        private final ByteBuffer event = ByteBuffer.allocate(EVENT + ThermalPayload.IRON_BYTES);
         boolean uniform;
-        private boolean hasThermalOutput, hasContrast, hasLockedTone;
+        private boolean hasThermalOutput, hasContrast, hasLockedTone, hasIron;
         long durationUs;
         private long bytes;
         int count;
@@ -73,15 +74,17 @@ final class MovieArchive {
             event.clear();
             event.putLong(captureUs);
             ThermalPayload.putSource(event, capture.frame);
+            ThermalPayload.putIron(event, capture);
             entries.write(event.array());
             int flags = capture.scale.locked() ? ThermalPayload.LOCKED : ThermalPayload.AUTO;
             if (capture.frame.thermalOutput) {
                 flags |= 2;
                 hasThermalOutput = true;
             }
-            hasContrast |= capture.scale.contrast != ColorScale.NORMAL;
+            hasIron |= capture.ironEnhanced;
+            hasContrast |= capture.paletteContrast() != ColorScale.NORMAL;
             hasLockedTone |= capture.lockedTone != 0;
-            entries.writeInt(flags | (capture.scale.contrast << 2) | (capture.lockedTone << 10));
+            entries.writeInt(flags | (capture.paletteContrast() << 2) | (capture.lockedTone << 10));
             bytes += size;
             count++;
         }
@@ -105,7 +108,7 @@ final class MovieArchive {
                     rows.readInt();
                     rows.readFully(event.array());
                     rows.readInt();
-                    out.write(event.array());
+                    out.write(event.array(), 0, EVENT);
                 }
             }
             // One byte per sample makes an explicitly locked range unambiguous even
@@ -114,6 +117,22 @@ final class MovieArchive {
             if (hasThermalOutput) writeFlags(out, PLANE_HIGH, PLANE_LOW, 1, 1);
             if (hasContrast) writeFlags(out, CONTRAST_HIGH, CONTRAST_LOW, 2, 255);
             if (hasLockedTone) writeFlags(out, TONE_HIGH, TONE_LOW, 10, 255);
+            if (hasIron) {
+                out.writeInt(1);
+                out.writeInt(UUID);
+                out.writeLong(36L + (long) count * ThermalPayload.IRON_BYTES);
+                out.writeLong(IRON_HIGH);
+                out.writeLong(IRON_LOW);
+                out.writeInt(VERSION);
+                try (DataInputStream rows = readIndex()) {
+                    for (int i = 0; i < count; i++) {
+                        rows.readInt();
+                        rows.readFully(event.array());
+                        rows.readInt();
+                        out.write(event.array(), EVENT, ThermalPayload.IRON_BYTES);
+                    }
+                }
+            }
             out.writeInt(1); // extended box size
             out.writeInt(UUID);
             out.writeLong(48L + (long) ENTRY * count + bytes);
@@ -189,6 +208,7 @@ final class MovieArchive {
         private final FileInputStream input;
         private final FileChannel channel;
         private final ByteBuffer scratch = ByteBuffer.allocate(EVENT);
+        private final ByteBuffer ironEntry = ByteBuffer.allocate(ThermalPayload.IRON_BYTES);
         private static final int PAGE_ENTRIES = 256;
         private final ByteBuffer indexPage = ByteBuffer.allocate(ENTRY * PAGE_ENTRIES);
         private final ByteBuffer packed = ByteBuffer.allocate(ThermalPayload.MAX_PACKED);
@@ -197,6 +217,7 @@ final class MovieArchive {
         private long index, data, end;
         private long events, displayFlags, displayCount, planeFlags, planeCount;
         private long contrastFlags, contrastCount, toneFlags, toneCount;
+        private long ironEntries, ironBytes;
         private int eventCount;
         private boolean uniform, legacyBursts;
         private MobileImage movieImage;
@@ -216,6 +237,8 @@ final class MovieArchive {
                 if (planeFlags != 0 && planeCount != count) throw new IOException("Mismatched MP4 plane count");
                 if (contrastFlags != 0 && contrastCount != count) throw new IOException("Mismatched MP4 contrast count");
                 if (toneFlags != 0 && toneCount != count) throw new IOException("Mismatched MP4 tone count");
+                if (ironEntries != 0 && ironBytes != (long) count * ThermalPayload.IRON_BYTES)
+                    throw new IOException("Mismatched MP4 iron curves");
                 legacyBursts = events == 0 && looksLikeLegacyBurst();
             } catch (IOException | RuntimeException e) {
                 close();
@@ -267,7 +290,8 @@ final class MovieArchive {
                     boolean plane = high == PLANE_HIGH && low == PLANE_LOW;
                     boolean contrast = high == CONTRAST_HIGH && low == CONTRAST_LOW;
                     boolean tone = high == TONE_HIGH && low == TONE_LOW;
-                    if ((plane || contrast || tone || (high == DISPLAY_HIGH && low == DISPLAY_LOW))
+                    boolean iron = high == IRON_HIGH && low == IRON_LOW;
+                    if ((plane || contrast || tone || iron || (high == DISPLAY_HIGH && low == DISPLAY_LOW))
                             && read(pos + header + 16, 4).getInt() == VERSION) {
                         if (plane) {
                             planeFlags = pos + header + 20;
@@ -275,6 +299,9 @@ final class MovieArchive {
                         } else if (contrast) {
                             contrastFlags = pos + header + 20;
                             contrastCount = size - header - 20;
+                        } else if (iron) {
+                            ironEntries = pos + header + 20;
+                            ironBytes = size - header - 20;
                         } else if (tone) {
                             toneFlags = pos + header + 20;
                             toneCount = size - header - 20;
@@ -368,9 +395,15 @@ final class MovieArchive {
             if (plane > 1) throw new IOException("Unknown temperature plane");
             int contrast = contrastFlags == 0 ? ColorScale.NORMAL : read(contrastFlags + i, 1).get() & 255;
             int tone = toneFlags == 0 ? 0 : read(toneFlags + i, 1).get() & 255;
+            if (ironEntries != 0) {
+                ironEntry.clear();
+                readFully(ironEntry, ironEntries + (long) i * ThermalPayload.IRON_BYTES);
+                ironEntry.flip();
+            }
             // Event metadata borrows scratch until the decoder consumes it.
             ByteBuffer source = events == 0 ? null : read(events + (long) i * EVENT + 8, ThermalPayload.SOURCE_BYTES);
-            return decoder.decode(packed.array(), size, source, display, plane == 1, contrast, tone);
+            return decoder.decode(packed.array(), size, source, display, plane == 1, contrast, tone,
+                    ironEntries == 0 ? null : ironEntry);
         }
 
         private ByteBuffer entry(int i) throws IOException {

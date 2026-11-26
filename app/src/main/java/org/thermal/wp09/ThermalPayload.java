@@ -18,7 +18,14 @@ final class ThermalPayload {
     private static final int MAX_RAW = HEADER + PIXELS * 8 + 2 + BlindPixels.MAX_USER * 2;
     static final int MAX_PACKED = MAX_RAW + 1024;
     static final int SOURCE_BYTES = 24;
+    static final int IRON_BYTES = 1 + 2 * Float.BYTES;
     static final int LEGACY_DISPLAY = -1, AUTO = 0, LOCKED = 1;
+
+    // Baked luma is viewable with the ordinary palette even by older readers.
+    static void putIron(ByteBuffer b, ThermalCapture capture) {
+        b.put((byte) (capture.ironEnhanced ? capture.scale.contrast : 0));
+        b.putFloat(capture.middleLow).putFloat(capture.middleHigh);
+    }
 
     // Optional container metadata. The primary WPT1 record remains readable by v0.9.2.
     static void putSource(ByteBuffer b, ThermalFrame frame) {
@@ -87,9 +94,10 @@ final class ThermalPayload {
         @Override public void close() { zip.end(); }
     }
 
-    static ThermalCapture decode(byte[] packed, ByteBuffer source, int display, boolean thermalOutput, int contrast, int tone) throws IOException {
+    static ThermalCapture decode(byte[] packed, ByteBuffer source, int display, boolean thermalOutput, int contrast,
+                                 int tone, ByteBuffer iron) throws IOException {
         try (Decoder decoder = new Decoder()) {
-            return decoder.decode(packed, packed.length, source, display, thermalOutput, contrast, tone);
+            return decoder.decode(packed, packed.length, source, display, thermalOutput, contrast, tone, iron);
         }
     }
 
@@ -97,14 +105,15 @@ final class ThermalPayload {
         private final byte[] raw = new byte[MAX_RAW];
         private final Inflater zip = new Inflater();
 
-        ThermalCapture decode(byte[] packed, int length, ByteBuffer source, int display, boolean thermalOutput, int contrast, int tone) throws IOException {
+        ThermalCapture decode(byte[] packed, int length, ByteBuffer source, int display, boolean thermalOutput,
+                              int contrast, int tone, ByteBuffer iron) throws IOException {
             if (length <= 0 || length > MAX_PACKED || length > packed.length) throw invalid();
             try {
                 zip.reset();
                 zip.setInput(packed, 0, length);
                 int size = zip.inflate(raw);
                 if (!zip.finished() || zip.getRemaining() != 0 || size < HEADER) throw invalid();
-                return unpack(ByteBuffer.wrap(raw, 0, size).order(ByteOrder.BIG_ENDIAN), source, display, thermalOutput, contrast, tone);
+                return unpack(ByteBuffer.wrap(raw, 0, size).order(ByteOrder.BIG_ENDIAN), source, display, thermalOutput, contrast, tone, iron);
             } catch (DataFormatException e) {
                 throw new IOException("Invalid temperature compression", e);
             }
@@ -113,10 +122,23 @@ final class ThermalPayload {
         @Override public void close() { zip.end(); }
     }
 
-    private static ThermalCapture unpack(ByteBuffer b, ByteBuffer source, int display, boolean thermalOutput, int contrast, int tone) throws IOException {
+    private static ThermalCapture unpack(ByteBuffer b, ByteBuffer source, int display, boolean thermalOutput,
+                                         int contrast, int tone, ByteBuffer iron) throws IOException {
         if (contrast < ColorScale.MIN_CONTRAST || contrast > ColorScale.MAX_CONTRAST) throw invalid();
         if (b.getInt() != MAGIC || b.getShort() != WIDTH || b.getShort() != HEIGHT) throw invalid();
         int kind = b.get(), palette = b.get(), applied = b.get();
+        float middleLow = Float.NaN, middleHigh = Float.NaN;
+        if (iron != null) {
+            int percent = iron.get() & 255;
+            if (percent != 0) {
+                middleLow = iron.getFloat();
+                middleHigh = iron.getFloat();
+                if (percent <= ColorScale.NORMAL || percent > ColorScale.MAX_CONTRAST || contrast != ColorScale.NORMAL
+                        || palette != 0 || !thermalOutput || kind < 3 || !ColorScale.validMiddle(middleLow, middleHigh))
+                    throw invalid();
+                contrast = percent;
+            }
+        }
         if (tone < 0 || tone > 101 || (tone != 0 && (!thermalOutput || display != LOCKED || kind < 3)))
             throw invalid();
         int firstColumn = source == null ? ThermalFrame.LEGACY_LEFT_MASK : source.getInt();
@@ -182,10 +204,11 @@ final class ThermalPayload {
                 if (sites[i] >= PIXELS || (i > 0 && sites[i] <= sites[i-1])) throw invalid();
             }
         }
-        ColorScale colorScale = new ColorScale(contrast, low, high);
+        ColorScale colorScale = new ColorScale(contrast, low, high, middleLow, middleHigh);
         ThermalFrame frame = new ThermalFrame(readings, brightness, cold, hot, min, max, center, average,
                 System.nanoTime(), markers, firstColumn, thermalOutput, sites,
-                new ThermalFrame.Display(palette, colorScale, Float.NaN, Float.NaN, null, tone, Float.NaN, Float.NaN));
+                new ThermalFrame.Display(palette, colorScale, Float.NaN, Float.NaN, null, tone, Float.NaN, Float.NaN,
+                        middleLow, middleHigh));
         return new ThermalCapture(frame, new Calibration(scale, offset, applied == 1), palette, colorScale, null);
     }
 

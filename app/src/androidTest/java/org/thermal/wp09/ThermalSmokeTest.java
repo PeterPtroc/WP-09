@@ -43,7 +43,7 @@ import java.util.zip.ZipInputStream;
 public final class ThermalSmokeTest extends Instrumentation {
     private boolean skipMedia, exportFieldFrames, exportMobileMovie, directReplay;
     private int seconds = 4;
-    private boolean doubleReplay;
+    private boolean doubleReplay, ironReplay;
     private long[] expectedDisplay;
     private ColorScale[] expectedScales;
     private byte[] rawDump, reference;
@@ -57,6 +57,7 @@ public final class ThermalSmokeTest extends Instrumentation {
         exportMobileMovie = options != null && "true".equals(options.getString("exportMobileMovie"));
         directReplay = options != null && "true".equals(options.getString("directReplay"));
         doubleReplay = directReplay && "true".equals(options.getString("doubleReplay"));
+        ironReplay = directReplay && "true".equals(options.getString("ironReplay"));
         if (options != null && options.containsKey("replaySeconds")) {
             seconds = Math.max(2, Math.min(120, Integer.parseInt(options.getString("replaySeconds"))));
         }
@@ -183,6 +184,7 @@ public final class ThermalSmokeTest extends Instrumentation {
         checkScaleAndAlarms(frame);
         checkLockedNoise();
         checkColorScale(activity, view, frame, calibration);
+        checkIronContrast();
         ThermalFrame both = new ThermalFrame(frame.readings, summary.preview, frame.cold, frame.hot,
                 frame.minimum, frame.maximum, frame.center, frame.average);
         checkFirmwareImage(both, summary, calibration);
@@ -500,19 +502,22 @@ public final class ThermalSmokeTest extends Instrumentation {
             int x = i % 256, y = i / 256;
             field[i] = (float)(25 + Math.sin(.32*x+.15*y) + Math.cos(.23*x-.38*y));
         }
-        PixelOps.liveLuma(field, history, 1, false, false, null, gray, single, null, null, Float.NaN, Float.NaN);
+        PixelOps.liveLuma(field, history, 1, false, false, null, gray, single, null, null,
+                Float.NaN, Float.NaN, 0, 0, 1, 1, null);
         for (int y = 1; y < 192; y++) for (int x = 1; x < 256; x++) {
             int i = y*256+x;
             // Half-pixel optical displacement and a small detail at the other sampling phase.
             int mean = ((gray[i] & 255) + (gray[i-1] & 255) + (gray[i-256] & 255) + (gray[i-257] & 255)) / 4;
             shifted[i] = (byte)Math.max(0, Math.min(255, mean + ((x+y)%2==0 ? 3 : -3)));
         }
-        PixelOps.liveLuma(field, history, 1, false, true, shifted, gray, fused, null, null, Float.NaN, Float.NaN);
+        PixelOps.liveLuma(field, history, 1, false, true, shifted, gray, fused, null, null,
+                Float.NaN, Float.NaN, 0, 0, 1, 1, null);
         int refined = 0;
         for (int i = 0; i < fused.length; i++) if (single[i] != fused[i]) refined++;
         check(refined > 500, "Verified subpixel motion contributes detail to the 2x image");
         Arrays.fill(shifted, (byte) 127);
-        PixelOps.liveLuma(field, history, 1, false, true, shifted, gray, fused, null, null, Float.NaN, Float.NaN);
+        PixelOps.liveLuma(field, history, 1, false, true, shifted, gray, fused, null, null,
+                Float.NaN, Float.NaN, 0, 0, 1, 1, null);
         check(Arrays.equals(single, fused), "Unregistrable exposure falls back to the current image");
     }
 
@@ -953,6 +958,81 @@ public final class ThermalSmokeTest extends Instrumentation {
                 stats[2], time, null, 0, true);
     }
 
+    private void checkIronContrast() throws Exception {
+        int width = ThermalFrame.WIDTH;
+        float[] plate = new float[ThermalFrame.PIXELS];
+        for (int row = 0; row < plate.length; row += width) {
+            Arrays.fill(plate, row, row + 16, 20f);
+            Arrays.fill(plate, row + 16, row + 60, 29f);
+            Arrays.fill(plate, row + 60, row + 120, 30f);
+            Arrays.fill(plate, row + 120, row + 165, 30.5f);
+            Arrays.fill(plate, row + 165, row + 241, 31f);
+            Arrays.fill(plate, row + 241, row + width, 60f);
+        }
+        ThermalFrame input = noiseFrame(plate, 20_000_000L);
+        LiveImage stream = new LiveImage();
+        LiveImage.Settings quality = new LiveImage.Settings(0, 0, false);
+        ColorScale strong = ColorScale.AUTO.withContrast(150);
+        ThermalFrame first = stream.process(input, quality, .98f, BlindPixels.NONE, strong);
+        ThermalCapture enhanced = new ThermalCapture(first, Calibration.DEFAULT, 0, strong, null);
+        ThermalCapture ordinary = new ThermalCapture(first, Calibration.DEFAULT, 0, ColorScale.AUTO, null);
+        int p = 96 * width + 86, q = 96 * width + 143;
+        int plainGap = (ordinary.brightness[q] & 255) - (ordinary.brightness[p] & 255);
+        int ironGap = (enhanced.brightness[q] & 255) - (enhanced.brightness[p] & 255);
+        check(plainGap <= 4 && ironGap >= 55 && ironGap <= 59 && enhanced.frame.readings == plate,
+                "Iron separates two 0.5 C reference patches before quantization");
+        Calibration cal = new Calibration(1.12f, 2f, true);
+        ThermalCapture current = new ThermalCapture(first, cal, 0, strong, null);
+        ColorScale lock = strong.lockAt(current);
+        ThermalCapture locked = new ThermalCapture(first, cal, 0, lock, null);
+        check(locked.brightness == current.brightness, "Lock takes the complete curve on the drawn exposure");
+        float[] hotter = plate.clone();
+        for (int i = 0; i < hotter.length; i++) if (i % width >= 180) hotter[i] = 95;
+        ThermalFrame second = stream.process(noiseFrame(hotter, 40_000_000L), quality, .98f, BlindPixels.NONE, lock, cal);
+        ThermalCapture stable = new ThermalCapture(second, cal, 0, lock, null);
+        check(stable.brightness[p] == locked.brightness[p] && stable.brightness[q] == locked.brightness[q]
+                        && stable.frame.temperatureAt(p) == 30 && stable.frame.temperatureAt(q) == 30.5f,
+                "Locked patch levels " + (locked.brightness[p] & 255) + "/" + (locked.brightness[q] & 255)
+                        + " became " + (stable.brightness[p] & 255) + "/" + (stable.brightness[q] & 255)
+                        + " at " + stable.frame.temperatureAt(p) + "/" + stable.frame.temperatureAt(q)
+                        + " C; windows " + first.display.imageLow + "/" + first.display.imageHigh + " and "
+                        + second.display.imageLow + "/" + second.display.imageHigh);
+        for (ThermalCapture c : new ThermalCapture[]{current, stable}) {
+            ByteArrayOutputStream png = new ByteArrayOutputStream();
+            RadiometricPng.write(png, c);
+            byte[] bytes = png.toByteArray();
+            ThermalCapture saved = RadiometricPng.read(new ByteArrayInputStream(bytes));
+            Bitmap standard = BitmapFactory.decodeByteArray(bytes, 0, bytes.length), album = saved.bitmap();
+            check(saved.ironEnhanced && saved.scale.contrast == 150 && standard.sameAs(album)
+                    && Arrays.equals(c.legendColors(), saved.legendColors()) && Arrays.equals(c.frame.readings, saved.frame.readings),
+                    "PNG, album, curve and calibrated measurement payload agree");
+            standard.recycle(); album.recycle();
+        }
+        LiveImage flatStream = new LiveImage();
+        float[] flat = new float[plate.length];
+        Arrays.fill(flat, 30f);
+        ThermalFrame uniform = flatStream.process(noiseFrame(flat, 20_000_000L), quality, .98f, BlindPixels.NONE, strong);
+        check(uniform.display.autoHigh - uniform.display.autoLow >= 1
+                && Math.abs((uniform.preview[p] & 255) - 128) <= 1 && uniform.preview[p] == uniform.preview[q],
+                "Isothermal input keeps a finite, noise-limited window");
+        java.util.Random noise = new java.util.Random(701);
+        double sum = 0, sumSquared = 0;
+        int samples = 24;
+        for (int i = 0; i < samples; i++) {
+            float[] noisy = plate.clone();
+            for (int k = 0; k < noisy.length; k++) noisy[k] += (noise.nextFloat() - .5f) * .3f;
+            ThermalFrame sample = stream.process(noiseFrame(noisy, (3L + i) * 20_000_000L),
+                    quality, .98f, BlindPixels.NONE, lock, cal);
+            int gap = (sample.preview[q] & 255) - (sample.preview[p] & 255);
+            sum += gap;
+            sumSquared += gap * gap;
+        }
+        double mean = sum / samples, spread = Math.sqrt(Math.max(0, sumSquared / samples - mean * mean));
+        check(mean > 30 && mean > 3 * spread, "Noisy 0.5 C patches retain repeatable contrast");
+        report.append("Iron 0.5 C patches: ").append(plainGap).append(" to ").append(ironGap)
+                .append(String.format(java.util.Locale.ROOT, " levels, noisy gap %.1f +/- %.1f; lock and PNG checked. ", mean, spread));
+    }
+
     private void checkColorScale(MainActivity activity, ThermalView view, ThermalFrame base, Calibration cal) throws Exception {
         int width = ThermalFrame.WIDTH;
         float[] changed = base.readings.clone();
@@ -1031,12 +1111,17 @@ public final class ThermalSmokeTest extends Instrumentation {
                     "Home shortcut locks the drawn exposure without altering any pixel");
             quick.setProgress(15);
             check(view.capture().scale.contrast == 125 && shortcut.isSelected(), "Direct contrast preserves the lock");
+            doubleTapContrast(quick);
+            check(view.capture().scale.contrast == 100 && shortcut.isSelected(), "Double tap resets only contrast");
             shortcut.performClick();
             quick.setProgress(10);
             check(!shortcut.isSelected() && !view.capture().scale.locked(), "Home shortcut unlocks in one tap");
             androidx.appcompat.app.AlertDialog panel = activity.chooseQuality();
             contrastSlider(panel).setProgress(20);
             check(view.capture().scale.contrast == 150 && view.capture().frame == first, "Live contrast preview");
+            doubleTapContrast(contrastSlider(panel));
+            check(view.capture().scale.contrast == 100, "Quality slider supports the same double tap");
+            contrastSlider(panel).setProgress(20);
             check(!view.compose(first, cal).scale.locked() && view.compose(first, cal).scale.contrast == 100,
                     "A pending batch keeps its exposure settings");
             lockButton(panel).performClick();
@@ -1044,12 +1129,22 @@ public final class ThermalSmokeTest extends Instrumentation {
             panel.cancel();
         });
         waitForIdleSync();
+        androidx.appcompat.app.AlertDialog[] confirmed = new androidx.appcompat.app.AlertDialog[1];
         runOnMainSync(() -> {
             check(!view.capture().scale.locked() && view.capture().scale.contrast == 100, "Cancel restores preview");
-            androidx.appcompat.app.AlertDialog panel = activity.chooseQuality();
-            contrastSlider(panel).setProgress(0);
-            lockButton(panel).performClick();
-            panel.getButton(android.content.DialogInterface.BUTTON_POSITIVE).performClick();
+            confirmed[0] = activity.chooseQuality();
+        });
+        waitForIdleSync();
+        runOnMainSync(() -> {
+            lockButton(confirmed[0]).performClick();
+            android.widget.SeekBar slider = contrastSlider(confirmed[0]);
+            long now = SystemClock.uptimeMillis();
+            MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, 1, slider.getHeight() / 2f, 0);
+            MotionEvent up = MotionEvent.obtain(now, now + 15, MotionEvent.ACTION_UP, 1, slider.getHeight() / 2f, 0);
+            slider.dispatchTouchEvent(down);
+            slider.dispatchTouchEvent(up);
+            down.recycle(); up.recycle();
+            confirmed[0].getButton(android.content.DialogInterface.BUTTON_POSITIVE).performClick();
         });
         waitForIdleSync();
         runOnMainSync(() -> {
@@ -1229,7 +1324,7 @@ public final class ThermalSmokeTest extends Instrumentation {
                     ? readFile(kb) : new byte[ThermalFrame.PIXELS * 4]);
             byte[][] realWire = directReplay && recorded != null ? realWireFrames() : null;
             LiveImage sequence = new LiveImage();
-            LiveImage.Settings quality = new LiveImage.Settings(1, 7, doubleReplay);
+            LiveImage.Settings quality = new LiveImage.Settings(1, ironReplay ? 0 : 7, doubleReplay);
             ShutterGate screening = new ShutterGate();
             expectedDisplay = directReplay ? new long[n] : null;
             expectedScales = directReplay ? new ColorScale[n] : null;
@@ -1433,7 +1528,7 @@ public final class ThermalSmokeTest extends Instrumentation {
                     check(restored.preview != null && imageChecksum(restored.preview) == expectedDisplay[i],
                             "Playback reproduces each exposure's finished display plane");
                     ColorScale expected = expectedScales[i];
-                    check(exposure.scale.contrast == expected.contrast
+                    check(exposure.ironEnhanced == ironReplay && exposure.scale.contrast == expected.contrast
                             && Float.compare(exposure.scale.low, expected.low) == 0
                             && Float.compare(exposure.scale.high, expected.high) == 0,
                             "Seek restores the exposure's contrast and Celsius window");
@@ -1511,6 +1606,21 @@ public final class ThermalSmokeTest extends Instrumentation {
                 });
             } else saveScreenshot("smoke-album.png");
             runOnMainSync(review::finish);
+        }
+    }
+
+    private static void doubleTapContrast(android.widget.SeekBar slider) {
+        long start = SystemClock.uptimeMillis();
+        float x = slider.getWidth() * .15f, y = slider.getHeight() / 2f;
+        int before = slider.getProgress();
+        for (int i = 0; i < 2; ++i) {
+            long down = start + 85L * i;
+            MotionEvent press = MotionEvent.obtain(down, down, MotionEvent.ACTION_DOWN, x, y, 0);
+            MotionEvent release = MotionEvent.obtain(down, down + 20, MotionEvent.ACTION_UP, x, y, 0);
+            slider.dispatchTouchEvent(press);
+            slider.dispatchTouchEvent(release);
+            press.recycle(); release.recycle();
+            if (i == 0) check(slider.getProgress() == before, "No intermediate contrast on the first tap");
         }
     }
 

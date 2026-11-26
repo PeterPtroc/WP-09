@@ -35,12 +35,13 @@ final class ThermalFrame {
         final ColorScale scale;
         final float autoLow, autoHigh;
         final float imageLow, imageHigh;
+        final float middleLow, middleHigh;
         final LiveImage.Filtered filtered;
         // 0 = legacy direct color, otherwise 1 + the profile's shadow lift in percent.
         final int tone;
 
         Display(int palette, ColorScale scale, float autoLow, float autoHigh, LiveImage.Filtered filtered, int tone,
-                float imageLow, float imageHigh) {
+                float imageLow, float imageHigh, float middleLow, float middleHigh) {
             this.palette = palette;
             this.scale = scale;
             this.autoLow = autoLow;
@@ -49,6 +50,8 @@ final class ThermalFrame {
             this.tone = tone;
             this.imageLow = imageLow;
             this.imageHigh = imageHigh;
+            this.middleLow = middleLow;
+            this.middleHigh = middleHigh;
         }
     }
 

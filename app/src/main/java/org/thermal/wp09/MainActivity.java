@@ -142,7 +142,9 @@ public final class MainActivity extends AppCompatActivity {
         scene = Math.max(0, Math.min(LiveImage.SCENES.length - 1, settings.getInt("scene", 0)));
         doubleSize = settings.getBoolean("doubleSize", false);
         colorScale = new ColorScale(settings.getInt("contrast", ColorScale.NORMAL),
-                settings.getFloat("windowLow", Float.NaN), settings.getFloat("windowHigh", Float.NaN));
+                settings.getFloat("windowLow", Float.NaN), settings.getFloat("windowHigh", Float.NaN),
+                settings.getFloat("windowMiddleLow", .125f), settings.getFloat("windowMiddleHigh", .875f),
+                settings.getFloat("windowSensorLow", Float.NaN), settings.getFloat("windowSensorHigh", Float.NaN));
         emissivity = settings.getFloat("emissivity", 0.98f);
         camera = new CameraController(usb, settings);
         camera.setQuality(scene, palette, doubleSize);
@@ -307,11 +309,12 @@ public final class MainActivity extends AppCompatActivity {
         choices.addView(group);
         TextView contrast = text(this, contrastLabel(colorScale.contrast), 14, TEXT);
         choices.addView(contrast);
-        choices.addView(contrastSlider(colorScale.contrast, percent -> {
+        ContrastSlider draftContrast = contrastSlider(colorScale.contrast, percent -> {
             draft[0] = draft[0].withContrast(percent);
             label(contrast, contrastLabel(percent));
             if (!recording && !recordingStarting) thermal.setColorScale(draft[0]);
-        }), new LinearLayout.LayoutParams(-1, dp(36)));
+        });
+        choices.addView(draftContrast, new LinearLayout.LayoutParams(-1, dp(36)));
         CheckBox lock = new CheckBox(this);
         lock.setText(scaleLabel(colorScale));
         lock.setChecked(colorScale.locked());
@@ -337,6 +340,7 @@ public final class MainActivity extends AppCompatActivity {
         scroll.addView(choices);
         AlertDialog panel = dialog().setTitle("画质").setView(scroll).setNegativeButton("取消", null)
                 .setPositiveButton("确定", (d, w) -> {
+                    draftContrast.commitPendingTap();
                     int nextScene = group.indexOfChild(group.findViewById(group.getCheckedRadioButtonId()));
                     boolean nextSize = recording || recordingStarting ? doubleSize : doubled.isChecked();
                     boolean imageChanged = nextScene != scene || nextSize != doubleSize;
@@ -360,8 +364,8 @@ public final class MainActivity extends AppCompatActivity {
 
     private static String contrastLabel(int percent) { return "对比度　" + percent + "%"; }
 
-    private SeekBar contrastSlider(int initial, IntConsumer changed) {
-        SeekBar slider = new SeekBar(this);
+    private ContrastSlider contrastSlider(int initial, IntConsumer changed) {
+        ContrastSlider slider = new ContrastSlider(this);
         slider.setContentDescription("对比度");
         slider.setMax((ColorScale.MAX_CONTRAST - ColorScale.MIN_CONTRAST) / 5);
         slider.setProgress((initial - ColorScale.MIN_CONTRAST) / 5);
@@ -393,7 +397,9 @@ public final class MainActivity extends AppCompatActivity {
         camera.setColorScale(next);
         thermal.setColorScale(next);
         settings.edit().putInt("contrast", next.contrast).putFloat("windowLow", next.low)
-                .putFloat("windowHigh", next.high).apply();
+                .putFloat("windowHigh", next.high).putFloat("windowMiddleLow", next.middleLow)
+                .putFloat("windowMiddleHigh", next.middleHigh).putFloat("windowSensorLow", next.originalLow)
+                .putFloat("windowSensorHigh", next.originalHigh).apply();
         syncQuickScale();
     }
 

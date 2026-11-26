@@ -50,6 +50,8 @@ final class ThermalCapture {
     final ColorScale scale;
     final MobileImage movieImage;
     final int lockedTone;
+    final boolean ironEnhanced;
+    final float middleLow, middleHigh;
     final byte[] brightness;
 
     ThermalCapture(ThermalFrame frame, Calibration calibration, int palette, float low, float high) {
@@ -64,15 +66,27 @@ final class ThermalCapture {
         this.movieImage = movieImage;
         ThermalFrame.Display display = frame.display;
         lockedTone = scale.locked() && display != null ? display.tone : 0;
+        middleLow = scale.locked() ? scale.middleLow : display == null ? Float.NaN : display.middleLow;
+        middleHigh = scale.locked() ? scale.middleHigh : display == null ? Float.NaN : display.middleHigh;
+        // Historical recordings contain the original S-curve contrast, applied after the stored luma.
+        ironEnhanced = scale.ironPercent(palette) > 0 && display != null
+                && ColorScale.validMiddle(display.middleLow, display.middleHigh);
         byte[] image = frame.preview;
         if (display != null && display.filtered != null) {
-            float low = scale.locked() ? (scale.low - calibration.offset) / calibration.scale : display.autoLow;
-            float high = scale.locked() ? (scale.high - calibration.offset) / calibration.scale : display.autoHigh;
+            float low = scale.locked() ? scale.sensorLow(calibration) : display.autoLow;
+            float high = scale.locked() ? scale.sensorHigh(calibration) : display.autoHigh;
             // A drawn auto exposure can be locked exactly, including its calibrated window.
             boolean same = low == display.imageLow && high == display.imageHigh ||
                     (scale.locked() && scale.low == calibration.apply(display.imageLow)
                             && scale.high == calibration.apply(display.imageHigh));
-            if (!same) image = display.filtered.window(low, high);
+            int percent = ironEnhanced ? scale.contrast : 0;
+            boolean sameCurve = percent == display.scale.ironPercent(display.palette);
+            if (sameCurve && percent > 0) {
+                float a = display.scale.locked() ? display.scale.middleLow : display.middleLow;
+                float b = display.scale.locked() ? display.scale.middleHigh : display.middleHigh;
+                sameCurve = a == middleLow && b == middleHigh;
+            }
+            if (!same || !sameCurve) image = display.filtered.window(low, high, percent, middleLow, middleHigh);
         }
         brightness = image;
     }
@@ -86,7 +100,7 @@ final class ThermalCapture {
         int[] colors = colors();
         float low = this.scale.low, high = this.scale.high;
         float scale = high > low ? 255f / (high - low) : 0;
-        if (lockedTone != 0 || brightness != frame.preview) {
+        if (ironEnhanced || lockedTone != 0 || brightness != frame.preview) {
             PixelOps.renderBrightness(brightness, colors, dest, 0, 0);
         } else if (frame.readings != null && Float.isFinite(low)) {
             PixelOps.renderTemperatures(frame.readings, colors, dest, calibration.scale, calibration.offset, low, high);
@@ -119,8 +133,10 @@ final class ThermalCapture {
         return colors[Math.max(0, Math.min(255, shade))];
     }
 
+    int paletteContrast() { return ironEnhanced ? ColorScale.NORMAL : scale.contrast; }
+
     int[] colors() {
-        if (scale.contrast == ColorScale.NORMAL) return COLORS[palette];
+        if (paletteContrast() == ColorScale.NORMAL) return COLORS[palette];
         int index = scale.contrast - ColorScale.MIN_CONTRAST;
         synchronized (CONTRAST_COLORS) {
             int[] colors = CONTRAST_COLORS[palette][index];
@@ -142,6 +158,11 @@ final class ThermalCapture {
 
     int[] legendColors() {
         int[] colors = colors();
+        if (ironEnhanced) {
+            int[] legend = new int[256];
+            PixelOps.ironLegend(middleLow, middleHigh, scale.contrast, Math.max(0, lockedTone - 1) / 100f, colors, legend);
+            return legend;
+        }
         if (lockedTone <= 1) return colors;
         int[] legend = new int[256];
         float lift = (lockedTone - 1) / 100f;

@@ -245,8 +245,61 @@ constexpr Tuning profiles[][2] = {
     {{.38f,.18f,1.25f,1.05f,1.06f,.003f,.04f}, {.36f,.16f,1.17f,.97f,1.02f,.003f,.11f}},
 };
 
+// Input and knees are fractions of the outer temperature window. Tiny tails
+// keep their original slope when they already occupy less than 5% of the scale.
+struct IronCurve {
+    float low, high, weight, lowLevel, highLevel, coldSlope, middleSlope, hotSlope;
+
+    IronCurve(float lower, float upper, int percent)
+        : low(lower), high(upper), weight(std::clamp((percent - 100) / 50.f, 0.f, 1.f)),
+          lowLevel(std::min(.05f, low)), highLevel(std::max(.95f, high)),
+          coldSlope(low > 0 ? lowLevel / low : 1.f),
+          middleSlope(high > low ? (highLevel - lowLevel) / (high - low) : 1.f),
+          hotSlope(high < 1 ? (1.f - highLevel) / (1.f - high) : 1.f) {}
+
+    float shade(float x, float shadow) const {
+        float basic = x + shadow * x * (1.f - x);
+        float target = x < low ? x * coldSlope : x > high ? highLevel + (x - high) * hotSlope
+                                                       : lowLevel + (x - low) * middleSlope;
+        return basic + weight * (target - basic);
+    }
+};
+
+// [outer low, outer high, shadow lift, inner low, inner high] in sensor Celsius.
+using Window = std::array<float, 5>;
+
+void ironWindow(Window& window, float outerLow, float outerHigh, float minSpan, float follow, bool enhanced) {
+    int tail = static_cast<int>(ws.sample.size() / 8);
+    float innerLow = ws.quantile(tail);
+    float innerHigh = ws.quantile(static_cast<int>(ws.sample.size()) - 1 - tail);
+    if (follow < 1 && window[1] > window[0] && outerLow < window[1] && outerHigh > window[0]) {
+        auto smooth = [follow](float past, float now) { return past + follow * (now - past); };
+        outerLow = smooth(window[0], outerLow);
+        outerHigh = smooth(window[1], outerHigh);
+        innerLow = smooth(window[3], innerLow);
+        innerHigh = smooth(window[4], innerHigh);
+    }
+    if (enhanced && outerHigh - outerLow < minSpan) {
+        // A sudden increase in noise takes precedence over slow automatic tracking.
+        float center = .5f * (outerLow + outerHigh);
+        outerLow = center - .5f * minSpan;
+        outerHigh = center + .5f * minSpan;
+    }
+    // Protect a nearly isothermal surface from having its noise fill the palette.
+    float half = .5f * std::max(innerHigh - innerLow, minSpan);
+    float center = .5f * (innerLow + innerHigh);
+    if (2 * half >= outerHigh - outerLow) {
+        innerLow = outerLow;
+        innerHigh = outerHigh;
+    } else {
+        innerLow = std::clamp(center - half, outerLow, outerHigh - 2 * half);
+        innerHigh = std::min(innerLow + 2 * half, outerHigh);
+    }
+    window = {outerLow, outerHigh, window[2], innerLow, innerHigh};
+}
+
 // Both windows consume the same denoised temperatures, before clipping to 8-bit gray.
-void tone(int left, const jint* lut, const Tuning* profile, float mid, float span) {
+void tone(int left, const jint* lut, const Tuning* profile, float mid, float span, const IronCurve* iron = nullptr) {
     ws.index(ws.smooth, left);
     for (int y = 0; y < height; ++y) for (int x = left; x < width; ++x) {
         int i = y * width + x;
@@ -258,7 +311,8 @@ void tone(int left, const jint* lut, const Tuning* profile, float mid, float spa
         float detail = std::clamp(v - ws.around(x, y, 9), -.15f * span, .15f * span);
         float signal = profile ? profile->contrast * (v - mid + profile->sharpness * detail) : v - mid + .5f * detail;
         float shade = span > 0.f ? std::clamp(.5f + signal / span, 0.f, 1.f) : .5f;
-        if (profile) shade += profile->shadow * shade * (1.f - shade);
+        if (iron) shade = iron->shade(shade, profile->shadow);
+        else if (profile) shade += profile->shadow * shade * (1.f - shade);
         int level = static_cast<int>(shade * 255 + .5f);
         if (lut) ws.colors[i] = lut[level];
         else ws.gray[i] = static_cast<uint8_t>(level);
@@ -266,7 +320,8 @@ void tone(int left, const jint* lut, const Tuning* profile, float mid, float spa
 }
 
 void render(int left, const jint* lut, bool thermalOutput, float sigma, const Tuning* profile = nullptr,
-            float* autoWindow = nullptr, float fixedLow = NAN, float fixedHigh = NAN) {
+            Window* autoWindow = nullptr, float fixedLow = NAN, float fixedHigh = NAN,
+            int ironPercent = 0, float fixedMiddleLow = 0, float fixedMiddleHigh = 1, float follow = 1) {
     if (thermalOutput) correctRows(left, sigma);
     ws.index(ws.field, left);
     float preserve = .18f / (.18f + sigma);
@@ -299,21 +354,32 @@ void render(int left, const jint* lut, bool thermalOutput, float sigma, const Tu
     }
     if (lut) std::fill(ws.colors.begin(), ws.colors.end(), static_cast<jint>(0xff000000u));
     else ws.gray.fill(0);
-    if (ws.sample.empty()) return;
+    if (ws.sample.empty()) {
+        if (autoWindow) autoWindow->fill(NAN);
+        return;
+    }
     int trim = profile ? static_cast<int>(ws.sample.size() * profile->trim) : static_cast<int>(ws.sample.size() / 100);
     float low = ws.quantile(trim), high = ws.quantile(static_cast<int>(ws.sample.size()) - 1 - trim);
     float minSpan = thermalOutput ? std::max(1.f, 20 * sigma) : 1.f;
     float span = std::max(high - low, minSpan), mid = (low + high) * .5f;
     if (autoWindow) {
         float half = span / (2.f * profile->contrast);
-        autoWindow[0] = mid - half;
-        autoWindow[1] = mid + half;
+        ironWindow(*autoWindow, mid - half, mid + half, minSpan, follow, ironPercent > 100);
+        if (ironPercent > 100) {
+            mid = ((*autoWindow)[0] + (*autoWindow)[1]) * .5f;
+            span = ((*autoWindow)[1] - (*autoWindow)[0]) * profile->contrast;
+        }
     }
     if (std::isfinite(fixedLow) && std::isfinite(fixedHigh)) {
         mid = (fixedLow + fixedHigh) * .5f;
         span = (fixedHigh - fixedLow) * profile->contrast;
+    } else if (ironPercent > 100 && autoWindow) {
+        float range = (*autoWindow)[1] - (*autoWindow)[0];
+        fixedMiddleLow = ((*autoWindow)[3] - (*autoWindow)[0]) / range;
+        fixedMiddleHigh = ((*autoWindow)[4] - (*autoWindow)[0]) / range;
     }
-    tone(left, lut, profile, mid, span);
+    IronCurve iron(fixedMiddleLow, fixedMiddleHigh, ironPercent);
+    tone(left, lut, profile, mid, span, ironPercent > 100 ? &iron : nullptr);
 }
 } // namespace
 
@@ -494,7 +560,8 @@ void reconstruct(bool paired) {
 extern "C" JNIEXPORT void JNICALL
 Java_org_thermal_wp09_PixelOps_liveLuma(JNIEnv* env, jclass, jfloatArray readings, jfloatArray history,
         jint scene, jboolean black, jboolean continuous, jbyteArray previous, jbyteArray low, jbyteArray high,
-        jfloatArray autoWindow, jfloatArray filtered, jfloat fixedLow, jfloat fixedHigh) {
+        jfloatArray autoWindow, jfloatArray filtered, jfloat fixedLow, jfloat fixedHigh, jint ironPercent,
+        jfloat middleLow, jfloat middleHigh, jfloat follow, jfloatArray previousField) {
     const Tuning& profile = profiles[std::clamp(scene, 0, 2)][black ? 1 : 0];
     env->GetFloatArrayRegion(readings, 0, pixels, ws.field.data());
     float sigma = ws.noise(0);
@@ -509,14 +576,27 @@ Java_org_thermal_wp09_PixelOps_liveLuma(JNIEnv* env, jclass, jfloatArray reading
         }
     }
     env->SetFloatArrayRegion(history, 0, pixels, ws.field.data());
-    float window[3] = {NAN, NAN, profile.shadow};
-    render(0, nullptr, true, sigma, &profile, window, fixedLow, fixedHigh);
-    if (autoWindow) env->SetFloatArrayRegion(autoWindow, 0, 3, window);
+    Window window = {NAN, NAN, profile.shadow, NAN, NAN};
+    if (autoWindow && follow < 1) env->GetFloatArrayRegion(autoWindow, 0, window.size(), window.data());
+    render(0, nullptr, true, sigma, &profile, &window, fixedLow, fixedHigh,
+           ironPercent, middleLow, middleHigh, follow);
+    if (autoWindow) env->SetFloatArrayRegion(autoWindow, 0, window.size(), window.data());
     if (filtered) env->SetFloatArrayRegion(filtered, 0, pixels, ws.smooth.data());
     bool paired = high && continuous && previous;
-    if (paired) env->GetByteArrayRegion(previous, 0, pixels, reinterpret_cast<jbyte*>(ws.previous.data()));
+    if (paired && !previousField)
+        env->GetByteArrayRegion(previous, 0, pixels, reinterpret_cast<jbyte*>(ws.previous.data()));
     env->SetByteArrayRegion(low, 0, pixels, reinterpret_cast<const jbyte*>(ws.gray.data()));
     if (high) {
+        if (previousField && continuous && window[1] > window[0]) {
+            // Reproject the previous exposure through today's adaptive curve before registration.
+            float range = window[1] - window[0];
+            IronCurve iron((window[3] - window[0]) / range, (window[4] - window[0]) / range, ironPercent);
+            env->GetFloatArrayRegion(previousField, 0, pixels, ws.smooth.data());
+            ws.previous = ws.gray;
+            tone(0, nullptr, &profile, (window[0] + window[1]) * .5f, range * profile.contrast, &iron);
+            std::swap(ws.gray, ws.previous);
+            paired = true;
+        }
         reconstruct(paired);
         env->SetByteArrayRegion(high, 0, pixels * 4, reinterpret_cast<const jbyte*>(ws.enlarged.data()));
     }
@@ -524,19 +604,33 @@ Java_org_thermal_wp09_PixelOps_liveLuma(JNIEnv* env, jclass, jfloatArray reading
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_thermal_wp09_PixelOps_windowLuma(JNIEnv* env, jclass, jfloatArray filtered, jfloatArray previous,
-        jint scene, jboolean black, jfloat low, jfloat high, jbyteArray output) {
+        jint scene, jboolean black, jfloat low, jfloat high, jint ironPercent,
+        jfloat middleLow, jfloat middleHigh, jbyteArray output) {
     const Tuning& profile = profiles[std::clamp(scene, 0, 2)][black ? 1 : 0];
     float mid = (low + high) * .5f, span = (high - low) * profile.contrast;
+    IronCurve iron(middleLow, middleHigh, ironPercent);
+    const IronCurve* curve = ironPercent > 100 ? &iron : nullptr;
     bool doubled = env->GetArrayLength(output) == pixels * 4;
     if (previous && doubled) {
         // Register the preceding exposure in the same range as the current one.
         env->GetFloatArrayRegion(previous, 0, pixels, ws.smooth.data());
-        tone(0, nullptr, &profile, mid, span);
+        tone(0, nullptr, &profile, mid, span, curve);
         ws.previous = ws.gray;
     }
     env->GetFloatArrayRegion(filtered, 0, pixels, ws.smooth.data());
-    tone(0, nullptr, &profile, mid, span);
+    tone(0, nullptr, &profile, mid, span, curve);
     if (doubled) reconstruct(previous != nullptr);
     const uint8_t* result = doubled ? ws.enlarged.data() : ws.gray.data();
     env->SetByteArrayRegion(output, 0, doubled ? pixels * 4 : pixels, reinterpret_cast<const jbyte*>(result));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_thermal_wp09_PixelOps_ironLegend(JNIEnv* env, jclass, jfloat low, jfloat high, jint percent,
+        jfloat shadow, jintArray palette, jintArray legend) {
+    IronCurve curve(low, high, percent);
+    std::array<jint, 256> colors, result;
+    env->GetIntArrayRegion(palette, 0, colors.size(), colors.data());
+    for (int i = 0; i < 256; ++i)
+        result[i] = colors[std::clamp(static_cast<int>(255 * curve.shade(i / 255.f, shadow) + .5f), 0, 255)];
+    env->SetIntArrayRegion(legend, 0, result.size(), result.data());
 }

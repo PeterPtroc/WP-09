@@ -18,9 +18,11 @@ final class PixelOps {
                                    int[] lut, int[] dest);
     static native void liveLuma(float[] readings, float[] history, int scene, boolean black,
                                 boolean continuous, byte[] previous, byte[] low, byte[] high, float[] autoWindow,
-                                float[] filtered, float fixedLow, float fixedHigh);
+                                float[] filtered, float fixedLow, float fixedHigh, int ironPercent,
+                                float middleLow, float middleHigh, float follow, float[] previousField);
     static native void windowLuma(float[] filtered, float[] previous, int scene, boolean black,
-                                  float low, float high, byte[] output);
+                                  float low, float high, int ironPercent, float middleLow, float middleHigh, byte[] output);
+    static native void ironLegend(float low, float high, int percent, float shadow, int[] palette, int[] legend);
     static native boolean yuv(int[] pixels, ByteBuffer y, int yOffset, int yStride, int yStep,
                               ByteBuffer u, int uOffset, int uStride, int uStep,
                               ByteBuffer v, int vOffset, int vStride, int vStep);

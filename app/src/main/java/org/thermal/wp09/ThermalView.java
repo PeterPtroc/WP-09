@@ -45,6 +45,7 @@ final class ThermalView extends View {
     private boolean measuring = true;
     private Shader gradient;
     private int gradientContrast, gradientTone;
+    private float gradientMiddleLow, gradientMiddleHigh;
     private float gradientTop, gradientBottom;
     private Runnable onSelection;
     private ThermalCapture lastDrawn;
@@ -123,7 +124,11 @@ final class ThermalView extends View {
         if (next != null) {
             measurement.start = visiblePixel(measurement.start);
             measurement.end = visiblePixel(measurement.end);
-            if (next.palette != palette || gradientContrast != next.scale.contrast || gradientTone != next.lockedTone) gradient = null;
+            float a = next.ironEnhanced ? next.middleLow : -1, b = next.ironEnhanced ? next.middleHigh : -1;
+            if (next.palette != palette || gradientContrast != next.scale.contrast || gradientTone != next.lockedTone
+                    || a != gradientMiddleLow || b != gradientMiddleHigh) gradient = null;
+            gradientMiddleLow = a;
+            gradientMiddleHigh = b;
             palette = next.palette;
             gradientContrast = next.scale.contrast;
             gradientTone = next.lockedTone;

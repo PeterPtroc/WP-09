@@ -16,6 +16,8 @@ final class CameraController {
     private final UsbManager usb;
     private final android.content.SharedPreferences prefs;
     private volatile LiveImage.Settings quality = new LiveImage.Settings(0, 0, false);
+    private volatile ColorScale colorScale = ColorScale.AUTO;
+    private volatile Calibration displayCalibration = Calibration.DEFAULT;
     private final HandlerThread thread = new HandlerThread("WP09 USB");
     private final Handler worker;
     private final HandlerThread previewThread = new HandlerThread("WP09 preview");
@@ -56,6 +58,9 @@ final class CameraController {
         if (scene != quality.scene || palette != quality.palette || doubleSize != quality.doubleSize)
             quality = new LiveImage.Settings(scene, palette, doubleSize);
     }
+
+    void setColorScale(ColorScale value) { colorScale = value; }
+    void setDisplayCalibration(Calibration value) { displayCalibration = value; }
 
     CameraRepairs repairs() {
         Session session = current;
@@ -312,7 +317,7 @@ final class CameraController {
         private ThermalFrame finishImage(ThermalFrame.Decoder reader, byte[] wire, ThermalFrame verified, float emiss) {
             CameraRepairs.Map map = repairs.current;
             ThermalFrame measured = map.correction == null ? verified : reader.repair(wire, verified, map.correction);
-            return measured == null ? null : image.process(measured, quality, emiss, map.sites);
+            return measured == null ? null : image.process(measured, quality, emiss, map.sites, colorScale, displayCalibration);
         }
 
         private ThermalFrame liveFrame(long stamp) {

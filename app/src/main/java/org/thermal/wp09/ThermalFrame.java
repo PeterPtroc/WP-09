@@ -28,7 +28,29 @@ final class ThermalFrame {
     final boolean thermalOutput;
     final Markers reported;
     final int[] repairedSites;
-    final int exposurePalette;
+    final Display display;
+
+    static final class Display {
+        final int palette;
+        final ColorScale scale;
+        final float autoLow, autoHigh;
+        final float imageLow, imageHigh;
+        final LiveImage.Filtered filtered;
+        // 0 = legacy direct color, otherwise 1 + the profile's shadow lift in percent.
+        final int tone;
+
+        Display(int palette, ColorScale scale, float autoLow, float autoHigh, LiveImage.Filtered filtered, int tone,
+                float imageLow, float imageHigh) {
+            this.palette = palette;
+            this.scale = scale;
+            this.autoLow = autoLow;
+            this.autoHigh = autoHigh;
+            this.filtered = filtered;
+            this.tone = tone;
+            this.imageLow = imageLow;
+            this.imageHigh = imageHigh;
+        }
+    }
 
     static final class Markers {
         final int cold, hot;
@@ -61,14 +83,14 @@ final class ThermalFrame {
     ThermalFrame(float[] readings, byte[] preview, int cold, int hot, float minimum, float maximum,
                  float center, float average, long capturedNanos, Markers firmware, int firstColumn, boolean thermalOutput) {
         this(readings, preview, cold, hot, minimum, maximum, center, average, capturedNanos,
-                firmware, firstColumn, thermalOutput, BlindPixels.NONE, -1);
+                firmware, firstColumn, thermalOutput, BlindPixels.NONE, null);
     }
 
     ThermalFrame(float[] readings, byte[] preview, int cold, int hot, float minimum, float maximum,
                  float center, float average, long capturedNanos, Markers firmware, int firstColumn,
-                 boolean thermalOutput, int[] repairedSites, int exposurePalette) {
+                 boolean thermalOutput, int[] repairedSites, Display display) {
         this.repairedSites = repairedSites;
-        this.exposurePalette = exposurePalette;
+        this.display = display;
         this.capturedNanos = capturedNanos;
         this.firstColumn = firstColumn;
         this.firmware = firmware;

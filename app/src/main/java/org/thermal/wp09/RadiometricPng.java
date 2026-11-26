@@ -20,6 +20,8 @@ final class RadiometricPng {
     private static final int SOURCE = 0x7770464d; // wpFM: active image window and paired firmware extrema
     private static final int DISPLAY = 0x77704453; // wpDS: explicit temperature-window lock
     private static final int PLANE = 0x7770504c; // wpPL: 1 = firmware thermal output
+    private static final int CONTRAST = 0x77704354; // wpCT: optional display contrast percent
+    private static final int LOCKED_TONE = 0x77704c54; // wpLT: processed fixed-window brightness
 
     static void write(OutputStream destination, ThermalCapture capture) throws IOException {
         Bitmap bitmap = capture.bitmap();
@@ -36,7 +38,10 @@ final class RadiometricPng {
         ByteBuffer metadata = ByteBuffer.allocate(ThermalPayload.SOURCE_BYTES);
         ThermalPayload.putSource(metadata, capture.frame);
         writeChunk(out, SOURCE, metadata.array(), metadata.capacity());
-        writeChunk(out, DISPLAY, new byte[]{(byte) (Float.isFinite(capture.low) ? 1 : 0)}, 1);
+        writeChunk(out, DISPLAY, new byte[]{(byte) (capture.scale.locked() ? 1 : 0)}, 1);
+        if (capture.scale.contrast != ColorScale.NORMAL)
+            writeChunk(out, CONTRAST, new byte[]{(byte) capture.scale.contrast}, 1);
+        if (capture.lockedTone != 0) writeChunk(out, LOCKED_TONE, new byte[]{(byte) capture.lockedTone}, 1);
         if (capture.frame.thermalOutput) writeChunk(out, PLANE, new byte[]{1}, 1);
         try (ThermalPayload.Encoder encoder = new ThermalPayload.Encoder()) {
             int size = encoder.encode(capture);
@@ -51,6 +56,7 @@ final class RadiometricPng {
         boolean nativeSize = false;
         ByteBuffer metadata = null;
         int display = ThermalPayload.LEGACY_DISPLAY;
+        int contrast = ColorScale.NORMAL, tone = 0;
         boolean thermalOutput = false;
         for (;;) {
             int length = in.readInt(), type = in.readInt();
@@ -62,18 +68,21 @@ final class RadiometricPng {
                 length -= 8;
             }
             if (type == IEND) return null;
-            if ((type == TEMPERATURE || type == SOURCE || type == DISPLAY || type == PLANE) && nativeSize) {
+            boolean singleByte = type == DISPLAY || type == PLANE || type == CONTRAST || type == LOCKED_TONE;
+            if ((type == TEMPERATURE || type == SOURCE || singleByte) && nativeSize) {
                 if (length > ThermalPayload.MAX_PACKED || (type == SOURCE && length != ThermalPayload.SOURCE_BYTES)
-                        || ((type == DISPLAY || type == PLANE) && length != 1))
+                        || (singleByte && length != 1))
                     throw new IOException("Invalid PNG record length");
                 byte[] bytes = new byte[length];
                 in.readFully(bytes);
                 if (in.readInt() != checksum(type, bytes, length)) throw new IOException("PNG checksum");
-                if (type == TEMPERATURE) return ThermalPayload.decode(bytes, metadata, display, thermalOutput);
+                if (type == TEMPERATURE) return ThermalPayload.decode(bytes, metadata, display, thermalOutput, contrast, tone);
                 if (type == PLANE) {
                     if (bytes[0] != 1) throw new IOException("Unknown temperature plane");
                     thermalOutput = true;
                 } else if (type == DISPLAY) display = bytes[0] & 255;
+                else if (type == CONTRAST) contrast = bytes[0] & 255;
+                else if (type == LOCKED_TONE) tone = bytes[0] & 255;
                 else metadata = ByteBuffer.wrap(bytes);
                 continue;
             }

@@ -29,6 +29,8 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.CheckBox;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -47,6 +49,7 @@ import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.function.DoubleConsumer;
+import java.util.function.IntConsumer;
 
 import static org.thermal.wp09.InstrumentUi.*;
 
@@ -76,6 +79,7 @@ public final class MainActivity extends AppCompatActivity {
     private int palette;
     private int scene;
     private boolean doubleSize, repairPicking;
+    private ColorScale colorScale = ColorScale.AUTO;
     private float emissivity;
     private ThermalFrame frame;
     private ThermalFrame liveFrame;
@@ -96,6 +100,9 @@ public final class MainActivity extends AppCompatActivity {
     private InspectionPanel inspection;
     private TextView status, empty, fps, alarmBanner;
     private MaterialButton photoButton, videoButton, galleryButton, pauseButton, shutterButton, laserButton;
+    private MaterialButton scaleButton;
+    private SeekBar quickContrast;
+    private TextView quickContrastLabel;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -134,9 +141,13 @@ public final class MainActivity extends AppCompatActivity {
         palette = Math.max(0, Math.min(ThermalCapture.PALETTE_NAMES.length - 1, settings.getInt("palette", 0)));
         scene = Math.max(0, Math.min(LiveImage.SCENES.length - 1, settings.getInt("scene", 0)));
         doubleSize = settings.getBoolean("doubleSize", false);
+        colorScale = new ColorScale(settings.getInt("contrast", ColorScale.NORMAL),
+                settings.getFloat("windowLow", Float.NaN), settings.getFloat("windowHigh", Float.NaN));
         emissivity = settings.getFloat("emissivity", 0.98f);
         camera = new CameraController(usb, settings);
         camera.setQuality(scene, palette, doubleSize);
+        camera.setColorScale(colorScale);
+        camera.setDisplayCalibration(calibration);
         camera.setEmissivity(emissivity);
         media = new ThermalMedia(this, this::message);
         alarms.low = settings.getFloat("alarmLow", Float.NaN);
@@ -152,6 +163,7 @@ public final class MainActivity extends AppCompatActivity {
         FrameLayout preview = new FrameLayout(this);
         root.addView(preview, new LinearLayout.LayoutParams(0, -1, 1));
         thermal = new ThermalView(this);
+        thermal.setColorScale(colorScale);
         thermal.setPalette(palette);
         preview.addView(thermal, new FrameLayout.LayoutParams(-1, -1));
         empty = text(this, "等待 WP-09 接入", 15, MUTED);
@@ -203,6 +215,37 @@ public final class MainActivity extends AppCompatActivity {
         galleryButton = action(captureRow, "相册", R.drawable.ic_gallery,
                 () -> startActivity(new Intent(this, GalleryActivity.class)));
 
+        LinearLayout quick = row(this);
+        panel.addView(quick);
+        scaleButton = action(quick, "锁定色阶", 0, () -> {
+            ColorScale next = colorScale.locked() ? colorScale.automatic() : colorScale.lockAt(thermal.drawnCapture());
+            if (next != colorScale) applyColorScale(next);
+            else message("等待测温数据");
+        });
+        FrameLayout control = new FrameLayout(this);
+        quickContrastLabel = text(this, "", 12, TEXT);
+        int labelHeight = quickContrastLabel.getPaint().getFontMetricsInt(null) + dp(4);
+        int buttonWidth = (int) Math.ceil(scaleButton.getPaint().measureText("锁定色阶")) + dp(16);
+        int sliderWidth = Math.max(dp(108), (int) Math.ceil(quickContrastLabel.getPaint().measureText(contrastLabel(150))) + dp(12));
+        int rowWidth = scroll.getLayoutParams().width - panel.getPaddingLeft() - panel.getPaddingRight();
+        boolean stacked = buttonWidth + dp(4) + sliderWidth > rowWidth;
+        if (stacked) quick.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams lockLayout = (LinearLayout.LayoutParams) scaleButton.getLayoutParams();
+        lockLayout.width = stacked ? -1 : buttonWidth;
+        lockLayout.weight = 0;
+        scaleButton.setLayoutParams(lockLayout);
+        quick.addView(control, new LinearLayout.LayoutParams(stacked ? -1 : 0,
+                Math.max(dp(48), labelHeight + dp(28)), stacked ? 0 : 1));
+        quickContrast = contrastSlider(colorScale.contrast, percent -> {
+            if (percent != colorScale.contrast) applyColorScale(colorScale.withContrast(percent));
+        });
+        quickContrast.setPadding(dp(12), labelHeight, dp(12), 0);
+        control.addView(quickContrast, new FrameLayout.LayoutParams(-1, -1));
+        quickContrastLabel.setGravity(Gravity.CENTER);
+        quickContrastLabel.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        control.addView(quickContrastLabel, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
+        syncQuickScale();
+
         inspection = new InspectionPanel(this, thermal);
         inspection.setPadding(0, dp(6), 0, dp(4));
         panel.addView(inspection);
@@ -228,26 +271,27 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void settingsMenu() {
-        String[] entries = {"色彩　" + ThermalCapture.PALETTE_NAMES[palette], "高低温提醒",
-                "发射率　" + emissivity, Float.isFinite(lowCalibrationReading) ? "校准高点" : "参考温度校准",
-                measuring ? "隐藏测量标记" : "显示测量标记",
-                "复位画面", "画质　" + LiveImage.SCENES[scene] + (doubleSize ? " · 2×" : ""), "坏点修正"};
+        String[] entries = {"色彩　" + ThermalCapture.PALETTE_NAMES[palette],
+                "画质　" + LiveImage.SCENES[scene] + (doubleSize ? " · 2×" : ""),
+                "高低温提醒", "发射率　" + emissivity, Float.isFinite(lowCalibrationReading) ? "校准高点" : "参考温度校准",
+                measuring ? "隐藏测量标记" : "显示测量标记", "复位画面", "坏点修正"};
         dialog().setTitle("设置").setItems(entries, (d, i) -> {
             switch (i) {
                 case 0: choosePalette(); break;
-                case 1: chooseAlarm(); break;
-                case 2: chooseEmissivity(); break;
-                case 3: if (frame != null && frame.hasTemperature()) chooseCalibration();
+                case 1: chooseQuality(); break;
+                case 2: chooseAlarm(); break;
+                case 3: chooseEmissivity(); break;
+                case 4: if (frame != null && frame.hasTemperature()) chooseCalibration();
                         else message("等待测温数据"); break;
-                case 4: measuring = !measuring; render(); break;
-                case 5: thermal.resetViewport(); break;
-                case 6: chooseQuality(); break;
+                case 5: measuring = !measuring; render(); break;
+                case 6: thermal.resetViewport(); break;
                 case 7: selectRepair(); break;
             }
         }).show();
     }
 
-    private void chooseQuality() {
+    AlertDialog chooseQuality() {
+        ColorScale[] draft = {colorScale};
         LinearLayout choices = new LinearLayout(this);
         choices.setOrientation(LinearLayout.VERTICAL);
         choices.setPadding(dp(20), 0, dp(20), 0);
@@ -261,25 +305,108 @@ public final class MainActivity extends AppCompatActivity {
         }
         group.check(group.getChildAt(scene).getId());
         choices.addView(group);
+        TextView contrast = text(this, contrastLabel(colorScale.contrast), 14, TEXT);
+        choices.addView(contrast);
+        choices.addView(contrastSlider(colorScale.contrast, percent -> {
+            draft[0] = draft[0].withContrast(percent);
+            label(contrast, contrastLabel(percent));
+            if (!recording && !recordingStarting) thermal.setColorScale(draft[0]);
+        }), new LinearLayout.LayoutParams(-1, dp(36)));
+        CheckBox lock = new CheckBox(this);
+        lock.setText(scaleLabel(colorScale));
+        lock.setChecked(colorScale.locked());
+        choices.addView(lock);
+        lock.setOnCheckedChangeListener((button, checked) -> {
+            if (checked) {
+                draft[0] = draft[0].lockAt(thermal.drawnCapture());
+                if (!draft[0].locked()) {
+                    lock.setChecked(false);
+                    message("等待测温数据");
+                    return;
+                }
+            } else draft[0] = draft[0].automatic();
+            lock.setText(scaleLabel(draft[0]));
+            if (!recording && !recordingStarting) thermal.setColorScale(draft[0]);
+        });
         android.widget.CheckBox doubled = new android.widget.CheckBox(this);
         doubled.setText("2× 增强成像");
         doubled.setChecked(doubleSize);
         doubled.setEnabled(!recording && !recordingStarting);
         choices.addView(doubled);
-        dialog().setTitle("画质").setView(choices).setNegativeButton("取消", null)
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(choices);
+        AlertDialog panel = dialog().setTitle("画质").setView(scroll).setNegativeButton("取消", null)
                 .setPositiveButton("确定", (d, w) -> {
-                    scene = group.indexOfChild(group.findViewById(group.getCheckedRadioButtonId()));
-                    if (!recording && !recordingStarting) doubleSize = doubled.isChecked();
-                    settings.edit().putInt("scene", scene).putBoolean("doubleSize", doubleSize).apply();
-                    applyQuality();
+                    int nextScene = group.indexOfChild(group.findViewById(group.getCheckedRadioButtonId()));
+                    boolean nextSize = recording || recordingStarting ? doubleSize : doubled.isChecked();
+                    boolean imageChanged = nextScene != scene || nextSize != doubleSize;
+                    scene = nextScene;
+                    doubleSize = nextSize;
+                    applyColorScale(draft[0]);
+                    if (imageChanged) {
+                        settings.edit().putInt("scene", scene).putBoolean("doubleSize", doubleSize).apply();
+                        applyQuality();
+                    }
                 }).show();
+        panel.setOnDismissListener(d -> thermal.setColorScale(colorScale));
+        android.view.Window window = panel.getWindow();
+        if (window != null) {
+            window.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+            window.setLayout(Math.min(dp(350), root.getWidth()), WindowManager.LayoutParams.WRAP_CONTENT);
+            window.setDimAmount(.12f);
+        }
+        return panel;
+    }
+
+    private static String contrastLabel(int percent) { return "对比度　" + percent + "%"; }
+
+    private SeekBar contrastSlider(int initial, IntConsumer changed) {
+        SeekBar slider = new SeekBar(this);
+        slider.setContentDescription("对比度");
+        slider.setMax((ColorScale.MAX_CONTRAST - ColorScale.MIN_CONTRAST) / 5);
+        slider.setProgress((initial - ColorScale.MIN_CONTRAST) / 5);
+        if (Build.VERSION.SDK_INT >= 30) slider.setStateDescription(initial + "%");
+        slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onStartTrackingTouch(SeekBar bar) {}
+            @Override public void onStopTrackingTouch(SeekBar bar) {}
+            @Override public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                int percent = ColorScale.MIN_CONTRAST + progress * 5;
+                if (Build.VERSION.SDK_INT >= 30) bar.setStateDescription(percent + "%");
+                changed.accept(percent);
+            }
+        });
+        return slider;
+    }
+
+    private void syncQuickScale() {
+        String action = colorScale.locked() ? "解锁色阶" : "锁定色阶";
+        label(scaleButton, action);
+        scaleButton.setSelected(colorScale.locked());
+        scaleButton.setEnabled(colorScale.locked() || (frame != null && frame.hasPixelTemperatures()));
+        if (Build.VERSION.SDK_INT >= 26) scaleButton.setTooltipText(scaleLabel(colorScale));
+        label(quickContrastLabel, contrastLabel(colorScale.contrast));
+        quickContrast.setProgress((colorScale.contrast - ColorScale.MIN_CONTRAST) / 5);
+    }
+
+    private void applyColorScale(ColorScale next) {
+        colorScale = next;
+        camera.setColorScale(next);
+        thermal.setColorScale(next);
+        settings.edit().putInt("contrast", next.contrast).putFloat("windowLow", next.low)
+                .putFloat("windowHigh", next.high).apply();
+        syncQuickScale();
+    }
+
+    private static String scaleLabel(ColorScale scale) {
+        return scale.locked() ? "锁定色阶　" + ThermalView.number(scale.low) + "–"
+                + ThermalView.number(scale.high) + " °C" : "锁定色阶";
     }
 
     private void applyQuality() {
         camera.setQuality(scene, palette, doubleSize);
         if (paused && frame != null && frame.thermalOutput) {
             frame = new LiveImage().process(frame, new LiveImage.Settings(scene, palette, doubleSize),
-                    emissivity, frame.repairedSites);
+                    emissivity, frame.repairedSites, colorScale, calibration);
         }
         render();
     }
@@ -446,7 +573,7 @@ public final class MainActivity extends AppCompatActivity {
         if (!(recording && pullingVideoMaps)) checkAlarm(next);
         if (!paused) {
             frame = next;
-            thermal.show(frame, calibration, measuring);
+            thermal.show(frame, calibration, measuring, recording);
             long now = SystemClock.elapsedRealtime();
             if (first || now - lastPanelAt >= 120) render();
         }
@@ -762,6 +889,7 @@ public final class MainActivity extends AppCompatActivity {
 
     private void saveCalibration(Calibration value) {
         calibration = value;
+        camera.setDisplayCalibration(value);
         inspection.reset();
         checkAlarm(liveFrame);
         settings.edit().putFloat("scale", value.scale).putFloat("offset", value.offset)
@@ -770,7 +898,7 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void render() {
-        thermal.show(frame, calibration, measuring);
+        thermal.show(frame, calibration, measuring, recording);
         lastPanelAt = SystemClock.elapsedRealtime();
         empty.setVisibility(frame == null ? View.VISIBLE : View.GONE);
         inspection.setVisibility(measuring ? View.VISIBLE : View.GONE);
@@ -787,12 +915,13 @@ public final class MainActivity extends AppCompatActivity {
         label(fps, streaming && !paused && thermal.fps() > 0
                 ? thermal.fps() + " fps" : "");
         boolean mapAvailable = CameraController.supportsFullFrame(selected);
+        scaleButton.setEnabled(colorScale.locked() || (frame != null && frame.hasPixelTemperatures()));
         photoButton.setEnabled(frame != null && !recordingStarting);
         videoButton.setEnabled(recording || (streaming && !paused
                 && !recordingStarting && (mapAvailable || (frame != null && frame.hasPixelTemperatures()))));
         if (videoButton.isSelected() != recording) {
             videoButton.setSelected(recording);
-            videoButton.setIconResource(recording ? R.drawable.ic_square : R.drawable.ic_video);
+            if (!largeText(this)) videoButton.setIconResource(recording ? R.drawable.ic_square : R.drawable.ic_video);
         }
         label(videoButton, recording ? "停止" : "录像");
         galleryButton.setEnabled(!recording && !recordingStarting);

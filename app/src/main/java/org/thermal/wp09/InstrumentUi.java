@@ -35,6 +35,8 @@ final class InstrumentUi {
 
     static int dp(Context c, float value) { return Math.round(c.getResources().getDisplayMetrics().density * value); }
 
+    static boolean largeText(Context c) { return c.getResources().getConfiguration().fontScale >= 1.4f; }
+
     static TextView text(Context c, String label, int size, int color) {
         TextView v = new TextView(c);
         v.setText(label);
@@ -69,7 +71,7 @@ final class InstrumentUi {
         b.setInsetBottom(0);
         b.setCornerRadius(0);
         b.setStrokeWidth(0);
-        if (icon != 0) b.setIconResource(icon);
+        if (icon != 0 && (label.isEmpty() || !largeText(c))) b.setIconResource(icon);
         b.setIconSize(dp(c, 16));
         b.setIconPadding(dp(c, 4));
         b.setIconGravity(MaterialButton.ICON_GRAVITY_TEXT_START);

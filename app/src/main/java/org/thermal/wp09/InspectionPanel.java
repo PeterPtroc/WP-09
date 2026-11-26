@@ -40,8 +40,12 @@ final class InspectionPanel extends LinearLayout {
         value = text(c, "—", 23, TEXT);
         value.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         value.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        reading.addView(name);
-        reading.addView(value, new LayoutParams(0, -2, 1));
+        boolean stacked = largeText(c);
+        if (stacked) reading.addView(name, new LayoutParams(0, -2, 1));
+        else {
+            reading.addView(name);
+            reading.addView(value, new LayoutParams(0, -2, 1));
+        }
         loupe = action(reading, "", R.drawable.ic_loupe, () ->
                 settings.edit().putBoolean("loupe", !settings.getBoolean("loupe", false)).apply());
         LayoutParams lp = (LayoutParams) loupe.getLayoutParams();
@@ -51,6 +55,11 @@ final class InspectionPanel extends LinearLayout {
         loupe.setContentDescription("局部放大");
         if (android.os.Build.VERSION.SDK_INT >= 26) loupe.setTooltipText("局部放大");
         addView(reading);
+        if (stacked) {
+            value.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+            value.setPadding(dp(c, 6), 0, dp(c, 6), 0);
+            addView(value);
+        }
         LinearLayout markers = row(c);
         addView(markers);
         hotMarker = marker(markers, "最高温");
@@ -89,7 +98,7 @@ final class InspectionPanel extends LinearLayout {
                 .putBoolean(SHOW_HOT, hotMarker.isChecked())
                 .putBoolean(SHOW_COLD, coldMarker.isChecked()).apply());
         button.setCheckable(true);
-        button.setSingleLine();
+        button.setMaxLines(2);
         if (android.os.Build.VERSION.SDK_INT >= 26) button.setTooltipText(title + "标记");
         return button;
     }
@@ -123,8 +132,17 @@ final class InspectionPanel extends LinearLayout {
         if (button.isChecked() && capture != null) {
             ThermalFrame f = capture.frame;
             float temp = capture.calibration.apply(hot ? f.reported.maximum : f.reported.minimum);
-            if (Float.isFinite(temp)) caption += (f.isEstimatedAt(hot ? f.reported.hot : f.reported.cold) ? " ≈" : " ")
-                    + ThermalView.number(temp) + "°";
+            if (Float.isFinite(temp)) {
+                String reading = (f.isEstimatedAt(hot ? f.reported.hot : f.reported.cold) ? "≈" : "")
+                        + ThermalView.number(temp) + "°";
+                caption = title + " " + reading;
+                int width = button.getWidth() - button.getCompoundPaddingLeft() - button.getCompoundPaddingRight();
+                if (width > 0 && button.getPaint().measureText(caption) > width) {
+                    String brief = hot ? "高" : "低";
+                    caption = brief + " " + reading;
+                    if (button.getPaint().measureText(caption) > width) caption = brief + "\n" + reading;
+                }
+            }
         }
         label(button, caption);
     }

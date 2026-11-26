@@ -19,6 +19,8 @@ final class ThermalCapture {
     };
     static final int[][] STOPS = new int[PALETTE_NAMES.length][];
     private static final int[][] COLORS = new int[PALETTE_NAMES.length][256];
+    private static final int[][][] CONTRAST_COLORS =
+            new int[PALETTE_NAMES.length][ColorScale.MAX_CONTRAST - ColorScale.MIN_CONTRAST + 1][];
     static {
         for (int p = 0; p < CLASSIC.length; p++) {
             int[] stops = STOPS[p] = CLASSIC[p];
@@ -45,33 +47,48 @@ final class ThermalCapture {
     final ThermalFrame frame;
     final Calibration calibration;
     final int palette;
-    // A finite pair is an explicit, calibrated Celsius lock. NaN selects automatic display.
-    final float low, high;
+    final ColorScale scale;
     final MobileImage movieImage;
+    final int lockedTone;
+    final byte[] brightness;
 
     ThermalCapture(ThermalFrame frame, Calibration calibration, int palette, float low, float high) {
-        this(frame, calibration, palette, low, high, null);
+        this(frame, calibration, palette, new ColorScale(ColorScale.NORMAL, low, high), null);
     }
 
-    ThermalCapture(ThermalFrame frame, Calibration calibration, int palette, float low, float high,
-                   MobileImage movieImage) {
+    ThermalCapture(ThermalFrame frame, Calibration calibration, int palette, ColorScale scale, MobileImage movieImage) {
         this.frame = frame;
         this.calibration = calibration;
         this.palette = palette;
-        this.low = low;
-        this.high = high;
+        this.scale = scale;
         this.movieImage = movieImage;
+        ThermalFrame.Display display = frame.display;
+        lockedTone = scale.locked() && display != null ? display.tone : 0;
+        byte[] image = frame.preview;
+        if (display != null && display.filtered != null) {
+            float low = scale.locked() ? (scale.low - calibration.offset) / calibration.scale : display.autoLow;
+            float high = scale.locked() ? (scale.high - calibration.offset) / calibration.scale : display.autoHigh;
+            // A drawn auto exposure can be locked exactly, including its calibrated window.
+            boolean same = low == display.imageLow && high == display.imageHigh ||
+                    (scale.locked() && scale.low == calibration.apply(display.imageLow)
+                            && scale.high == calibration.apply(display.imageHigh));
+            if (!same) image = display.filtered.window(low, high);
+        }
+        brightness = image;
     }
 
     ThermalCapture forMovie(MobileImage image) {
-        return new ThermalCapture(frame, calibration, palette, low, high, image);
+        return new ThermalCapture(frame, calibration, palette, scale, image);
     }
 
     void render(int[] dest, int[] brightnessLut) {
         if (dest.length != rasterPixels()) throw new IllegalArgumentException("Display plane size");
-        int[] colors = COLORS[palette];
+        int[] colors = colors();
+        float low = this.scale.low, high = this.scale.high;
         float scale = high > low ? 255f / (high - low) : 0;
-        if (frame.readings != null && Float.isFinite(low)) {
+        if (lockedTone != 0 || brightness != frame.preview) {
+            PixelOps.renderBrightness(brightness, colors, dest, 0, 0);
+        } else if (frame.readings != null && Float.isFinite(low)) {
             PixelOps.renderTemperatures(frame.readings, colors, dest, calibration.scale, calibration.offset, low, high);
         } else if (frame.readings != null && (frame.preview == null || movieImage != null && frame.displayScale() == 1)) {
             PixelOps.renderMobile(frame.readings, frame.firstColumn, frame.thermalOutput,
@@ -98,8 +115,41 @@ final class ThermalCapture {
 
     private int color(float raw, int[] colors, float scale) {
         if (!Float.isFinite(raw)) return Color.BLACK;
-        int shade = scale == 0 ? 127 : Math.round((calibration.apply(raw) - low) * scale);
+        int shade = scale == 0 ? 127 : Math.round((calibration.apply(raw) - this.scale.low) * scale);
         return colors[Math.max(0, Math.min(255, shade))];
+    }
+
+    int[] colors() {
+        if (scale.contrast == ColorScale.NORMAL) return COLORS[palette];
+        int index = scale.contrast - ColorScale.MIN_CONTRAST;
+        synchronized (CONTRAST_COLORS) {
+            int[] colors = CONTRAST_COLORS[palette][index];
+            if (colors == null) {
+                colors = new int[256];
+                float gain = scale.contrast / 100f;
+                for (int i = 0; i < colors.length; i++) {
+                    float t = 2f * i / 255f - 1f;
+                    // Monotone S-curve with fixed endpoints and midpoint slope equal to gain.
+                    float mapped = gain * t / (1f + (gain - 1f) * Math.abs(t));
+                    int level = Math.round((1f + mapped) * 127.5f);
+                    colors[i] = COLORS[palette][Math.max(0, Math.min(255, level))];
+                }
+                CONTRAST_COLORS[palette][index] = colors;
+            }
+            return colors;
+        }
+    }
+
+    int[] legendColors() {
+        int[] colors = colors();
+        if (lockedTone <= 1) return colors;
+        int[] legend = new int[256];
+        float lift = (lockedTone - 1) / 100f;
+        for (int i = 0; i < legend.length; ++i) {
+            float t = i / 255f;
+            legend[i] = colors[Math.round(255f * (t + lift * t * (1f - t)))];
+        }
+        return legend;
     }
 
     Bitmap bitmap() {

@@ -45,6 +45,7 @@ public final class ThermalSmokeTest extends Instrumentation {
     private int seconds = 4;
     private boolean doubleReplay;
     private long[] expectedDisplay;
+    private ColorScale[] expectedScales;
     private byte[] rawDump, reference;
     private ThermalFrame[] recorded;
     private final StringBuilder report = new StringBuilder();
@@ -180,6 +181,8 @@ public final class ThermalSmokeTest extends Instrumentation {
         checkPayload(frame, calibration);
         checkPayload(decoder.decode(new byte[ThermalFrame.BYTES], 0.98f), calibration);
         checkScaleAndAlarms(frame);
+        checkLockedNoise();
+        checkColorScale(activity, view, frame, calibration);
         ThermalFrame both = new ThermalFrame(frame.readings, summary.preview, frame.cold, frame.hot,
                 frame.minimum, frame.maximum, frame.center, frame.average);
         checkFirmwareImage(both, summary, calibration);
@@ -497,19 +500,19 @@ public final class ThermalSmokeTest extends Instrumentation {
             int x = i % 256, y = i / 256;
             field[i] = (float)(25 + Math.sin(.32*x+.15*y) + Math.cos(.23*x-.38*y));
         }
-        PixelOps.liveLuma(field, history, 1, false, false, null, gray, single);
+        PixelOps.liveLuma(field, history, 1, false, false, null, gray, single, null, null, Float.NaN, Float.NaN);
         for (int y = 1; y < 192; y++) for (int x = 1; x < 256; x++) {
             int i = y*256+x;
             // Half-pixel optical displacement and a small detail at the other sampling phase.
             int mean = ((gray[i] & 255) + (gray[i-1] & 255) + (gray[i-256] & 255) + (gray[i-257] & 255)) / 4;
             shifted[i] = (byte)Math.max(0, Math.min(255, mean + ((x+y)%2==0 ? 3 : -3)));
         }
-        PixelOps.liveLuma(field, history, 1, false, true, shifted, gray, fused);
+        PixelOps.liveLuma(field, history, 1, false, true, shifted, gray, fused, null, null, Float.NaN, Float.NaN);
         int refined = 0;
         for (int i = 0; i < fused.length; i++) if (single[i] != fused[i]) refined++;
         check(refined > 500, "Verified subpixel motion contributes detail to the 2x image");
         Arrays.fill(shifted, (byte) 127);
-        PixelOps.liveLuma(field, history, 1, false, true, shifted, gray, fused);
+        PixelOps.liveLuma(field, history, 1, false, true, shifted, gray, fused, null, null, Float.NaN, Float.NaN);
         check(Arrays.equals(single, fused), "Unregistrable exposure falls back to the current image");
     }
 
@@ -602,7 +605,7 @@ public final class ThermalSmokeTest extends Instrumentation {
             ByteArrayOutputStream png = new ByteArrayOutputStream();
             RadiometricPng.write(png, raw);
             ThermalCapture decoded = RadiometricPng.read(new ByteArrayInputStream(png.toByteArray()));
-            check(Float.isFinite(decoded.low) == locked, "PNG preserves lock equal to frame extrema");
+            check(decoded.scale.locked() == locked, "PNG preserves lock equal to frame extrema");
             decoded.render(b, lut);
             check(Arrays.equals(a, b), "Raw still uses the same phone display and lock as the movie");
         }
@@ -667,7 +670,7 @@ public final class ThermalSmokeTest extends Instrumentation {
                 ThermalCapture c = r.frame(i);
                 ThermalFrame f = c.frame;
                 if (f.hasFirmwareImage()) paired++;
-                check(c.movieImage != null && c.movieImage.bias != null && !Float.isFinite(c.low),
+                check(c.movieImage != null && c.movieImage.bias != null && !c.scale.locked(),
                         "One phone display profile across matched and unmatched field frames");
                 checkFieldBounds(c);
                 long start = System.nanoTime();
@@ -675,7 +678,7 @@ public final class ThermalSmokeTest extends Instrumentation {
                 cost[i] = System.nanoTime() - start;
                 ThermalFrame opposite = new ThermalFrame(f.readings, f.preview == null ? new byte[pixels.length] : null,
                         f.cold, f.hot, f.minimum, f.maximum, f.center, f.average, 0, null, f.firstColumn);
-                new ThermalCapture(opposite, c.calibration, c.palette, c.low, c.high, c.movieImage).render(other, lut);
+                new ThermalCapture(opposite, c.calibration, c.palette, c.scale, c.movieImage).render(other, lut);
                 check(Arrays.equals(pixels, other), "Rendering is independent of UVC availability on every exposure");
                 if (export != null) {
                     export.offer(c, r.captureUs(i) * 1000, true);
@@ -896,6 +899,186 @@ public final class ThermalSmokeTest extends Instrumentation {
         check(alarm.state == 0, "Disconnect clears alert");
     }
 
+    private void checkLockedNoise() {
+        int width = ThermalFrame.WIDTH;
+        float[] field = new float[ThermalFrame.PIXELS];
+        java.util.Random random = new java.util.Random(83);
+        for (int i = 0; i < field.length; i++) {
+            int x = i % width;
+            field[i] = (x < 36 ? 27f : x > 165 ? 33f : 30f) + (random.nextFloat() - .5f) * .48f;
+        }
+        LiveImage stream = new LiveImage();
+        LiveImage.Settings white = new LiveImage.Settings(0, 2, false);
+        ThermalFrame first = stream.process(noiseFrame(field, 20_000_000L), white, .98f, BlindPixels.NONE);
+        ThermalCapture auto = new ThermalCapture(first, Calibration.DEFAULT, 2, ColorScale.AUTO, null);
+        ColorScale locked = ColorScale.AUTO.lockAt(auto);
+        float[] hotter = field.clone();
+        for (int i = 0; i < hotter.length; i++) if (i % width > 165) hotter[i] += 40;
+        ThermalFrame next = stream.process(noiseFrame(hotter, 40_000_000L), white, .98f, BlindPixels.NONE, locked);
+        ThermalCapture after = new ThermalCapture(next, Calibration.DEFAULT, 2, locked, null);
+        int[] former = new int[field.length];
+        PixelOps.renderTemperatures(hotter, auto.colors(), former, 1, 0, locked.low, locked.high);
+        double rawPower = 0, cleanPower = 0;
+        int count = 0, maxShift = 0;
+        for (int y = 40; y < 152; y++) for (int x = 52; x < 135; x++) {
+            int i = y * width + x;
+            int v = after.brightness[i] & 255;
+            int rawDelta = (former[i] & 255) - (former[i-1] & 255);
+            int cleanDelta = v - (after.brightness[i-1] & 255);
+            rawPower += rawDelta * rawDelta;
+            cleanPower += cleanDelta * cleanDelta;
+            maxShift = Math.max(maxShift, Math.abs(v - (auto.brightness[i] & 255)));
+            count++;
+        }
+        check(rawPower > 0 && cleanPower < rawPower * .5 && maxShift <= 1,
+                "Fixed range preserves a noisy reference surface after a distant object heats up: " + maxShift);
+        int hot = width * 96 + 220;
+        check((after.brightness[hot] & 255) == 255 && after.frame.temperatureAt(hot) > 70,
+                "Out-of-range heat clips visually and remains measurable");
+        java.util.Arrays.fill(hotter, 31.5f);
+        ThermalFrame flat = stream.process(noiseFrame(hotter, 60_000_000L), white, .98f, BlindPixels.NONE, locked);
+        ThermalCapture narrowScene = new ThermalCapture(flat, Calibration.DEFAULT, 2, locked, null);
+        int expected = Math.round(255 * (31.5f - locked.low) / (locked.high - locked.low));
+        check(Math.abs((narrowScene.brightness[ThermalFrame.CENTER] & 255) - expected) <= 1,
+                "Unclipped temperatures retain their absolute level even in a narrow new scene");
+        report.append(String.format(java.util.Locale.ROOT, "Flat patch adjacent-pixel RMS %.2f direct / %.2f fixed, max shift %d gray. ",
+                Math.sqrt(rawPower / count), Math.sqrt(cleanPower / count), maxShift));
+    }
+
+    private static ThermalFrame noiseFrame(float[] field, long time) {
+        float[] stats = new float[3];
+        PixelOps.maskAndMeasure(field, stats, 0);
+        int cold = (int) stats[0], hot = (int) stats[1];
+        return new ThermalFrame(field, null, cold, hot, field[cold], field[hot], field[ThermalFrame.CENTER],
+                stats[2], time, null, 0, true);
+    }
+
+    private void checkColorScale(MainActivity activity, ThermalView view, ThermalFrame base, Calibration cal) throws Exception {
+        int width = ThermalFrame.WIDTH;
+        float[] changed = base.readings.clone();
+        for (int i = 0; i < changed.length; i++) if (i % width > 140) changed[i] += 30;
+        float[] stats = new float[3];
+        PixelOps.maskAndMeasure(changed, stats, 0);
+        int cold = (int) stats[0], hot = (int) stats[1];
+        ThermalFrame next = new ThermalFrame(changed, null, cold, hot, changed[cold], changed[hot],
+                changed[ThermalFrame.CENTER], stats[2], base.capturedNanos + 20_000_000L, null, 0, true);
+        LiveImage sequence = new LiveImage();
+        LiveImage.Settings quality = new LiveImage.Settings(1, 4, true);
+        ThermalFrame first = sequence.process(base, quality, .98f, BlindPixels.NONE);
+        ColorScale strong = ColorScale.AUTO.withContrast(150);
+        ThermalCapture automatic = new ThermalCapture(first, cal, 4, strong, null);
+        ColorScale lock = strong.lockAt(automatic);
+        check(lock.locked() && lock.low == cal.apply(first.display.autoLow) && lock.high == cal.apply(first.display.autoHigh)
+                && lock.high > lock.low, "Lock the actual automatic display window in calibrated Celsius");
+        ThermalFrame second = sequence.process(next, quality, .98f, BlindPixels.NONE, lock, cal);
+        ThermalCapture lockedOne = new ThermalCapture(first, cal, 4, lock, null);
+        ThermalCapture lockedTwo = new ThermalCapture(second, cal, 4, lock, null);
+        int[] a = new int[lockedOne.rasterPixels()], b = a.clone(), lut = new int[256];
+        lockedOne.render(a, lut);
+        automatic.render(b, lut);
+        check(Arrays.equals(a, b), "Every enhanced pixel is identical on the exposure being locked");
+        lockedTwo.render(b, lut);
+        ThermalCapture secondAuto = new ThermalCapture(second, cal, 4, strong, null);
+        check(lockedTwo.lockedTone > 0 && lockedTwo.brightness == second.preview
+                        && !Arrays.equals(lockedTwo.brightness, secondAuto.brightness),
+                "One imaging pass delivers the fixed window; the frozen exposure can return to auto");
+        ThermalCapture neutral = new ThermalCapture(first, cal, 4, lock.withContrast(100), null);
+        neutral.render(b, lut);
+        check(!Arrays.equals(a, b) && neutral.colors()[0] == lockedOne.colors()[0]
+                && neutral.colors()[255] == lockedOne.colors()[255], "Contrast changes only the middle of the transfer curve");
+        ByteArrayOutputStream png = new ByteArrayOutputStream();
+        RadiometricPng.write(png, lockedTwo);
+        byte[] bytes = png.toByteArray();
+        ThermalCapture saved = RadiometricPng.read(new ByteArrayInputStream(bytes));
+        Bitmap stock = BitmapFactory.decodeByteArray(bytes, 0, bytes.length), inAlbum = saved.bitmap();
+        check(stock.sameAs(inAlbum) && saved.lockedTone == lockedTwo.lockedTone && saved.scale.contrast == 150 && saved.scale.low == lock.low
+                && saved.scale.high == lock.high && Arrays.equals(saved.frame.readings, changed),
+                "Ordinary PNG and album agree, including contrast, fixed scale and all temperatures");
+        stock.recycle(); inAlbum.recycle();
+        ThermalCapture[] exposures = {automatic, lockedOne, lockedTwo,
+                new ThermalCapture(second, cal, 4, ColorScale.AUTO.withContrast(50), null)};
+        if (!skipMedia) {
+            File clip = File.createTempFile("scale-", ".mp4", getTargetContext().getCacheDir());
+            try {
+                try (ThermalVideo video = new ThermalVideo(clip.getParentFile(), true, 2)) {
+                    for (int i = 0; i < exposures.length; i++) video.offer(exposures[i], i * 20_000_000L, true);
+                    video.finish(80_000_000L);
+                    try (FileOutputStream out = new FileOutputStream(clip)) { video.writeTo(out); }
+                }
+                try (MovieArchive.Reader reader = new MovieArchive.Reader(getTargetContext().getContentResolver()
+                        .openAssetFileDescriptor(Uri.fromFile(clip), "r"))) {
+                    for (int i : new int[]{2, 0, 3, 1}) {
+                        ThermalCapture actual = reader.frame(i), expected = exposures[i];
+                        check(actual.scale.contrast == expected.scale.contrast
+                                && Float.compare(actual.scale.low, expected.scale.low) == 0
+                                && Float.compare(actual.scale.high, expected.scale.high) == 0
+                                && Arrays.equals(actual.frame.readings, expected.frame.readings), "Per-exposure settings after seek");
+                        actual.render(a, lut); expected.render(b, lut);
+                        check(Arrays.equals(a, b), "Random-access album colors match the encoded capture");
+                    }
+                }
+            } finally { clip.delete(); }
+        }
+        runOnMainSync(() -> {
+            activity.receive(first);
+            Bitmap screen = Bitmap.createBitmap(view.getWidth(), view.getHeight(), Bitmap.Config.ARGB_8888);
+            view.draw(new android.graphics.Canvas(screen));
+            screen.recycle();
+            MaterialButton shortcut = field(activity, "scaleButton", MaterialButton.class);
+            android.widget.SeekBar quick = field(activity, "quickContrast", android.widget.SeekBar.class);
+            shortcut.performClick();
+            check(shortcut.isSelected() && view.capture().scale.locked() && view.capture().brightness == first.preview,
+                    "Home shortcut locks the drawn exposure without altering any pixel");
+            quick.setProgress(15);
+            check(view.capture().scale.contrast == 125 && shortcut.isSelected(), "Direct contrast preserves the lock");
+            shortcut.performClick();
+            quick.setProgress(10);
+            check(!shortcut.isSelected() && !view.capture().scale.locked(), "Home shortcut unlocks in one tap");
+            androidx.appcompat.app.AlertDialog panel = activity.chooseQuality();
+            contrastSlider(panel).setProgress(20);
+            check(view.capture().scale.contrast == 150 && view.capture().frame == first, "Live contrast preview");
+            check(!view.compose(first, cal).scale.locked() && view.compose(first, cal).scale.contrast == 100,
+                    "A pending batch keeps its exposure settings");
+            lockButton(panel).performClick();
+            check(view.capture().scale.locked(), "Lock checkbox takes the drawn exposure");
+            panel.cancel();
+        });
+        waitForIdleSync();
+        runOnMainSync(() -> {
+            check(!view.capture().scale.locked() && view.capture().scale.contrast == 100, "Cancel restores preview");
+            androidx.appcompat.app.AlertDialog panel = activity.chooseQuality();
+            contrastSlider(panel).setProgress(0);
+            lockButton(panel).performClick();
+            panel.getButton(android.content.DialogInterface.BUTTON_POSITIVE).performClick();
+        });
+        waitForIdleSync();
+        runOnMainSync(() -> {
+            android.content.SharedPreferences prefs = activity.getSharedPreferences("wp09", 0);
+            check(view.capture().scale.contrast == 50 && view.capture().scale.locked()
+                    && prefs.getFloat("windowLow", Float.NaN) == view.capture().scale.low
+                    && prefs.getInt("contrast", -1) == 50, "Apply persists lock and contrast");
+            androidx.appcompat.app.AlertDialog panel = activity.chooseQuality();
+            check(lockButton(panel).isChecked(), "Reopening the panel keeps the lock");
+            contrastSlider(panel).setProgress(10);
+            lockButton(panel).performClick();
+            panel.getButton(android.content.DialogInterface.BUTTON_POSITIVE).performClick();
+        });
+        waitForIdleSync();
+        report.append("Contrast preview/cancel/apply, fixed Celsius colors, 2x PNG and per-frame MP4 seeks checked. ");
+    }
+
+    private static android.widget.SeekBar contrastSlider(androidx.appcompat.app.AlertDialog panel) {
+        ArrayList<View> matches = new ArrayList<>();
+        panel.getWindow().getDecorView().findViewsWithText(matches, "对比度", View.FIND_VIEWS_WITH_CONTENT_DESCRIPTION);
+        return (android.widget.SeekBar) matches.get(0);
+    }
+
+    private static android.widget.CheckBox lockButton(androidx.appcompat.app.AlertDialog panel) {
+        ArrayList<View> matches = new ArrayList<>();
+        panel.getWindow().getDecorView().findViewsWithText(matches, "锁定色阶", View.FIND_VIEWS_WITH_TEXT);
+        return (android.widget.CheckBox) matches.get(0);
+    }
+
     private void checkVariableMovie(ThermalFrame preview, ThermalFrame full) throws Exception {
         File cache = getTargetContext().getCacheDir();
         File demo = new File(cache, "wp09-sample.mp4");
@@ -1004,7 +1187,7 @@ public final class ThermalSmokeTest extends Instrumentation {
                 for (int i = 0; i < reader.size(); i++) {
                     ThermalCapture stored = reader.frame(i);
                     ThermalFrame saved = stored.frame;
-                    check(stored.movieImage != null && Float.isFinite(stored.low) == (i == 23),
+                    check(stored.movieImage != null && stored.scale.locked() == (i == 23),
                             "Short recording flushes all pending frames and preserves exact manual locks");
                     check(Arrays.equals(saved.readings, expected[i].readings)
                             && Arrays.equals(saved.preview, expected[i].preview), "Burst pairing preserved");
@@ -1049,10 +1232,14 @@ public final class ThermalSmokeTest extends Instrumentation {
             LiveImage.Settings quality = new LiveImage.Settings(1, 7, doubleReplay);
             ShutterGate screening = new ShutterGate();
             expectedDisplay = directReplay ? new long[n] : null;
+            expectedScales = directReplay ? new ColorScale[n] : null;
+            ColorScale automatic = ColorScale.AUTO.withContrast(125);
+            ColorScale fixed = automatic;
             float[][] referencePlanes = new float[8][];
             List<ThermalCapture> batch = new ArrayList<>(8);
             java.util.concurrent.Semaphore batches = new java.util.concurrent.Semaphore(2);
             long firstNs = 0, lastNs = 0;
+            long lockStartNs = 0, lockEndNs = 0;
             long start = SystemClock.elapsedRealtime();
             for (int i = 0; i < n; i++) {
                 long left = start + i * 20L - SystemClock.elapsedRealtime();
@@ -1065,8 +1252,18 @@ public final class ThermalSmokeTest extends Instrumentation {
                         : recorded == null ? decoder.decode(wire, 0.98f)
                         : decoder.decodeSnapshot(rawDump, j, reference, 0.98f);
                 if (directReplay) check(decoded != null && !screening.suspect(decoded, input), "Valid thermal exposure");
-                ThermalFrame f = directReplay ? sequence.process(decoded, quality, .98f, BlindPixels.NONE) : decoded;
-                if (directReplay) expectedDisplay[i] = imageChecksum(f.preview);
+                ColorScale scale = i >= n / 3 && i < 2 * n / 3 ? fixed : automatic;
+                ThermalFrame f = directReplay ? sequence.process(decoded, quality, .98f, BlindPixels.NONE, scale) : decoded;
+                if (directReplay) {
+                    if (i == 0) {
+                        fixed = automatic.lockAt(new ThermalCapture(f, Calibration.DEFAULT, quality.palette, automatic, null));
+                        check(fixed.locked(), "Replay can lock a real measurement window");
+                    }
+                    expectedDisplay[i] = imageChecksum(f.preview);
+                    expectedScales[i] = scale;
+                }
+                if (i == n / 3) lockStartNs = f.capturedNanos;
+                if (i == 2 * n / 3 - 1) lockEndNs = f.capturedNanos;
                 if (referencePlanes[j] == null) referencePlanes[j] = f.readings;
                 expected.add(referencePlanes[j]);
                 if (i == 0) firstNs = f.capturedNanos;
@@ -1075,10 +1272,11 @@ public final class ThermalSmokeTest extends Instrumentation {
                 if (submit) check(batches.tryAcquire(3, TimeUnit.SECONDS), "Map encoder keeps up with capture");
                 boolean concurrentPhoto = directReplay && i % 350 == 60;
                 runOnMainSync(() -> {
+                    if (directReplay) view.setColorScale(scale);
                     activity.receive(f);
                     if (directReplay) {
                         if (concurrentPhoto) media.photo(view.drawnCapture(), false);
-                        batch.add(view.capture());
+                        batch.add(view.compose(f, Calibration.DEFAULT));
                         if (submit) {
                             media.burst(batch.toArray(new ThermalCapture[0]), ok -> {
                                 if (!ok) result.offer("encoding error");
@@ -1107,6 +1305,8 @@ public final class ThermalSmokeTest extends Instrumentation {
             report.append(String.format(java.util.Locale.ROOT, "%dx%d %s replay: %.2f input fps, %d/%d distinct view draws, %d AVC samples. ",
                     doubleReplay ? 512 : 256, doubleReplay ? 384 : 192, realWire != null ? "real AD" : "fixture",
                     (n - 1) * 1e9 / span, draws.get(), n, encoded));
+            if (directReplay) report.append(String.format(java.util.Locale.ROOT, "Locked segment %.2f fps. ",
+                    (2 * n / 3 - n / 3 - 1) * 1e9 / (lockEndNs - lockStartNs)));
             checkReview(image, movie, photoFrame);
         } finally { media.destroy(); }
     }
@@ -1227,10 +1427,17 @@ public final class ThermalSmokeTest extends Instrumentation {
                 check(mp4.getSampleTime() >= 0 && Math.abs(pts - mp4.getSampleTime()) <= 20,
                         "Metadata synchronized at frame " + i + " (" + pts + ", " + mp4.getSampleTime() + ")");
                 check(reader.atTime(pts) == i, "Seek finds exact frame");
-                ThermalFrame restored = reader.frame(i).frame;
-                if (expectedDisplay != null && inputs.size() == expectedDisplay.length)
+                ThermalCapture exposure = reader.frame(i);
+                ThermalFrame restored = exposure.frame;
+                if (expectedDisplay != null && inputs.size() == expectedDisplay.length) {
                     check(restored.preview != null && imageChecksum(restored.preview) == expectedDisplay[i],
                             "Playback reproduces each exposure's finished display plane");
+                    ColorScale expected = expectedScales[i];
+                    check(exposure.scale.contrast == expected.contrast
+                            && Float.compare(exposure.scale.low, expected.low) == 0
+                            && Float.compare(exposure.scale.high, expected.high) == 0,
+                            "Seek restores the exposure's contrast and Celsius window");
+                }
                 while (inputIndex < inputs.size() && !Arrays.equals(restored.readings, inputs.get(inputIndex))) inputIndex++;
                 check(inputIndex++ < inputs.size(), "Every decoded video plane matches a submitted frame");
                 mp4.advance();
@@ -1371,6 +1578,15 @@ public final class ThermalSmokeTest extends Instrumentation {
                     "Camera stays landscape with system rotation " + rotation);
             check(activity.getRequestedOrientation() == android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE,
                     "Landscape locked");
+            for (String key : new String[]{"scaleButton", "quickContrastLabel"}) {
+                TextView caption = field(activity, key, TextView.class);
+                Rect bounds = new Rect();
+                check(caption.getGlobalVisibleRect(bounds) && bounds.width() == caption.getWidth()
+                        && bounds.height() == caption.getHeight() && caption.getLineCount() == 1
+                        && caption.getPaint().measureText(caption.getText().toString())
+                        <= caption.getWidth() - caption.getCompoundPaddingLeft() - caption.getCompoundPaddingRight() + 1,
+                        "Primary display control fits in full at the current font scale: " + key);
+            }
             RectF bounds = field(view, "image", RectF.class);
             check(Math.abs(bounds.width() / bounds.height() - 4f / 3) < 0.01f, "Sensor aspect ratio");
             int nativeX = 91, nativeY = 42;

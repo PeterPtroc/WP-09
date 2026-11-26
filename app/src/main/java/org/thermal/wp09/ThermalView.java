@@ -39,9 +39,12 @@ final class ThermalView extends View {
     private boolean multi, dragged;
     private int dragStart, dragEnd;
     private ThermalCapture capture;
+    private ColorScale viewScale = ColorScale.AUTO;
+    private boolean recordingView;
     private int palette;
     private boolean measuring = true;
     private Shader gradient;
+    private int gradientContrast, gradientTone;
     private float gradientTop, gradientBottom;
     private Runnable onSelection;
     private ThermalCapture lastDrawn;
@@ -79,20 +82,38 @@ final class ThermalView extends View {
 
     ThermalCapture compose(ThermalFrame frame, Calibration calibration) {
         if (frame == null) return null;
-        int color = frame.exposurePalette >= 0 ? frame.exposurePalette : palette;
-        return new ThermalCapture(frame, calibration, color, Float.NaN, Float.NaN,
+        // Batches may reach the recorder after the user changed the screen controls.
+        return compose(frame, calibration, frame.display == null ? viewScale : frame.display.scale);
+    }
+
+    private ThermalCapture compose(ThermalFrame frame, Calibration calibration, ColorScale scale) {
+        int color = frame.display != null ? frame.display.palette : palette;
+        if (scale.locked() && !frame.hasPixelTemperatures()) scale = scale.automatic();
+        return new ThermalCapture(frame, calibration, color, scale,
                 capture != null && capture.frame == frame ? capture.movieImage : null);
     }
 
-    void show(ThermalFrame frame, Calibration calibration, boolean enabled) {
+    void setColorScale(ColorScale scale) {
+        if (viewScale == scale) return;
+        viewScale = scale;
+        if (capture != null) display(forScreen(capture.frame, capture.calibration));
+    }
+
+    private ThermalCapture forScreen(ThermalFrame frame, Calibration calibration) {
+        return recordingView ? compose(frame, calibration) : compose(frame, calibration, viewScale);
+    }
+
+    void show(ThermalFrame frame, Calibration calibration, boolean enabled, boolean recording) {
         boolean changed = measuring != enabled;
         measuring = enabled;
+        boolean modeChanged = recording != recordingView;
+        recordingView = recording;
         if (frame == null && capture == null && !changed) return;
-        if (capture != null && capture.frame == frame && capture.calibration == calibration) {
+        if (!modeChanged && capture != null && capture.frame == frame && capture.calibration == calibration) {
             if (changed) invalidate();
             return;
         }
-        display(compose(frame, calibration));
+        display(frame == null ? null : forScreen(frame, calibration));
     }
 
     /** Album playback uses the palette and temperature window saved for each frame. */
@@ -102,8 +123,10 @@ final class ThermalView extends View {
         if (next != null) {
             measurement.start = visiblePixel(measurement.start);
             measurement.end = visiblePixel(measurement.end);
-            if (next.palette != palette) gradient = null;
+            if (next.palette != palette || gradientContrast != next.scale.contrast || gradientTone != next.lockedTone) gradient = null;
             palette = next.palette;
+            gradientContrast = next.scale.contrast;
+            gradientTone = next.lockedTone;
             int scale = next.frame.displayScale();
             if (rendered.length != next.rasterPixels()) rendered = new int[next.rasterPixels()];
             next.render(rendered, lut);
@@ -121,7 +144,7 @@ final class ThermalView extends View {
     void setPalette(int value) {
         palette = value;
         gradient = null;
-        if (capture != null) display(compose(capture.frame, capture.calibration));
+        if (capture != null) display(forScreen(capture.frame, capture.calibration));
         else invalidate();
     }
 
@@ -166,7 +189,7 @@ final class ThermalView extends View {
     }
 
     @Override protected void onDraw(Canvas canvas) {
-        boolean degrees = measuring && capture != null && Float.isFinite(capture.low);
+        boolean degrees = measuring && capture != null && capture.scale.locked();
         float gutter = degrees ? d(49) : 0;
         float available = Math.max(1, getWidth() - gutter - d(4));
         float scale = Math.min(available / active.width(), Math.max(1, getHeight() - d(degrees ? 22 : 8)) / HEIGHT);
@@ -180,6 +203,7 @@ final class ThermalView extends View {
         canvas.save();
         canvas.clipRect(image);
         paint.setColor(Color.WHITE);
+        paint.setFilterBitmap(!capture.scale.locked() || capture.lockedTone != 0);
         canvas.drawBitmap(bitmap, null, activeDestination, paint);
         if (measuring && capture.frame.hasTemperature()) {
             drawSelection(canvas);
@@ -368,7 +392,7 @@ final class ThermalView extends View {
         if (gradient == null || image.top != gradientTop || image.bottom != gradientBottom) {
             gradientTop = image.top;
             gradientBottom = image.bottom;
-            gradient = new LinearGradient(0, image.bottom, 0, image.top, ThermalCapture.STOPS[palette], null, Shader.TileMode.CLAMP);
+            gradient = new LinearGradient(0, image.bottom, 0, image.top, capture.legendColors(), null, Shader.TileMode.CLAMP);
         }
         paint.setColor(Color.WHITE);
         paint.setShader(gradient);
@@ -381,7 +405,7 @@ final class ThermalView extends View {
             float f = i / 4f;
             float y = image.top + f * image.height();
             canvas.drawLine(x + d(6), y, x + d(9), y, paint);
-            canvas.drawText(number(capture.high + (capture.low - capture.high) * f), x + d(11), y + d(3), paint);
+            canvas.drawText(number(capture.scale.high + (capture.scale.low - capture.scale.high) * f), x + d(11), y + d(3), paint);
         }
         canvas.drawText("°C", x + d(11), image.top - d(1), paint);
     }

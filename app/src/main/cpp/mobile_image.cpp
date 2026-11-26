@@ -245,7 +245,28 @@ constexpr Tuning profiles[][2] = {
     {{.38f,.18f,1.25f,1.05f,1.06f,.003f,.04f}, {.36f,.16f,1.17f,.97f,1.02f,.003f,.11f}},
 };
 
-void render(int left, const jint* lut, bool thermalOutput, float sigma, const Tuning* profile = nullptr) {
+// Both windows consume the same denoised temperatures, before clipping to 8-bit gray.
+void tone(int left, const jint* lut, const Tuning* profile, float mid, float span) {
+    ws.index(ws.smooth, left);
+    for (int y = 0; y < height; ++y) for (int x = left; x < width; ++x) {
+        int i = y * width + x;
+        float v = ws.smooth[i];
+        if (!std::isfinite(v)) {
+            if (!lut) ws.gray[i] = 0;
+            continue;
+        }
+        float detail = std::clamp(v - ws.around(x, y, 9), -.15f * span, .15f * span);
+        float signal = profile ? profile->contrast * (v - mid + profile->sharpness * detail) : v - mid + .5f * detail;
+        float shade = span > 0.f ? std::clamp(.5f + signal / span, 0.f, 1.f) : .5f;
+        if (profile) shade += profile->shadow * shade * (1.f - shade);
+        int level = static_cast<int>(shade * 255 + .5f);
+        if (lut) ws.colors[i] = lut[level];
+        else ws.gray[i] = static_cast<uint8_t>(level);
+    }
+}
+
+void render(int left, const jint* lut, bool thermalOutput, float sigma, const Tuning* profile = nullptr,
+            float* autoWindow = nullptr, float fixedLow = NAN, float fixedHigh = NAN) {
     if (thermalOutput) correctRows(left, sigma);
     ws.index(ws.field, left);
     float preserve = .18f / (.18f + sigma);
@@ -283,19 +304,16 @@ void render(int left, const jint* lut, bool thermalOutput, float sigma, const Tu
     float low = ws.quantile(trim), high = ws.quantile(static_cast<int>(ws.sample.size()) - 1 - trim);
     float minSpan = thermalOutput ? std::max(1.f, 20 * sigma) : 1.f;
     float span = std::max(high - low, minSpan), mid = (low + high) * .5f;
-    ws.index(ws.smooth, left);
-    for (int y = 0; y < height; ++y) for (int x = left; x < width; ++x) {
-        int i = y * width + x;
-        float v = ws.smooth[i];
-        if (!std::isfinite(v)) continue;
-        float detail = std::clamp(v - ws.around(x, y, 9), -.15f * span, .15f * span);
-        float signal = profile ? profile->contrast * (v - mid + profile->sharpness * detail) : v - mid + .5f * detail;
-        float shade = std::clamp(.5f + signal / span, 0.f, 1.f);
-        if (profile) shade += profile->shadow * shade * (1.f - shade);
-        int level = static_cast<int>(shade * 255 + .5f);
-        if (lut) ws.colors[i] = lut[level];
-        else ws.gray[i] = static_cast<uint8_t>(level);
+    if (autoWindow) {
+        float half = span / (2.f * profile->contrast);
+        autoWindow[0] = mid - half;
+        autoWindow[1] = mid + half;
     }
+    if (std::isfinite(fixedLow) && std::isfinite(fixedHigh)) {
+        mid = (fixedLow + fixedHigh) * .5f;
+        span = (fixedHigh - fixedLow) * profile->contrast;
+    }
+    tone(left, lut, profile, mid, span);
 }
 } // namespace
 
@@ -475,7 +493,8 @@ void reconstruct(bool paired) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_thermal_wp09_PixelOps_liveLuma(JNIEnv* env, jclass, jfloatArray readings, jfloatArray history,
-        jint scene, jboolean black, jboolean continuous, jbyteArray previous, jbyteArray low, jbyteArray high) {
+        jint scene, jboolean black, jboolean continuous, jbyteArray previous, jbyteArray low, jbyteArray high,
+        jfloatArray autoWindow, jfloatArray filtered, jfloat fixedLow, jfloat fixedHigh) {
     const Tuning& profile = profiles[std::clamp(scene, 0, 2)][black ? 1 : 0];
     env->GetFloatArrayRegion(readings, 0, pixels, ws.field.data());
     float sigma = ws.noise(0);
@@ -490,11 +509,34 @@ Java_org_thermal_wp09_PixelOps_liveLuma(JNIEnv* env, jclass, jfloatArray reading
         }
     }
     env->SetFloatArrayRegion(history, 0, pixels, ws.field.data());
-    render(0, nullptr, true, sigma, &profile);
-    if (high && continuous) env->GetByteArrayRegion(previous, 0, pixels, reinterpret_cast<jbyte*>(ws.previous.data()));
+    float window[3] = {NAN, NAN, profile.shadow};
+    render(0, nullptr, true, sigma, &profile, window, fixedLow, fixedHigh);
+    if (autoWindow) env->SetFloatArrayRegion(autoWindow, 0, 3, window);
+    if (filtered) env->SetFloatArrayRegion(filtered, 0, pixels, ws.smooth.data());
+    bool paired = high && continuous && previous;
+    if (paired) env->GetByteArrayRegion(previous, 0, pixels, reinterpret_cast<jbyte*>(ws.previous.data()));
     env->SetByteArrayRegion(low, 0, pixels, reinterpret_cast<const jbyte*>(ws.gray.data()));
     if (high) {
-        reconstruct(continuous);
+        reconstruct(paired);
         env->SetByteArrayRegion(high, 0, pixels * 4, reinterpret_cast<const jbyte*>(ws.enlarged.data()));
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_thermal_wp09_PixelOps_windowLuma(JNIEnv* env, jclass, jfloatArray filtered, jfloatArray previous,
+        jint scene, jboolean black, jfloat low, jfloat high, jbyteArray output) {
+    const Tuning& profile = profiles[std::clamp(scene, 0, 2)][black ? 1 : 0];
+    float mid = (low + high) * .5f, span = (high - low) * profile.contrast;
+    bool doubled = env->GetArrayLength(output) == pixels * 4;
+    if (previous && doubled) {
+        // Register the preceding exposure in the same range as the current one.
+        env->GetFloatArrayRegion(previous, 0, pixels, ws.smooth.data());
+        tone(0, nullptr, &profile, mid, span);
+        ws.previous = ws.gray;
+    }
+    env->GetFloatArrayRegion(filtered, 0, pixels, ws.smooth.data());
+    tone(0, nullptr, &profile, mid, span);
+    if (doubled) reconstruct(previous != nullptr);
+    const uint8_t* result = doubled ? ws.enlarged.data() : ws.gray.data();
+    env->SetByteArrayRegion(output, 0, doubled ? pixels * 4 : pixels, reinterpret_cast<const jbyte*>(result));
 }

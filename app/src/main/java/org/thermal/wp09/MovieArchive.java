@@ -27,6 +27,8 @@ final class MovieArchive {
     private static final long EVENTS_HIGH = 0x3b9585a9c6e34f41L, EVENTS_LOW = 0xb252ede58e9a79c2L;
     private static final long DISPLAY_HIGH = 0x9ebdf3398d3a4524L, DISPLAY_LOW = 0xa156598f9e29ee65L;
     private static final long PLANE_HIGH = 0x5d099768a2184140L, PLANE_LOW = 0x93bedd598bf84407L;
+    private static final long CONTRAST_HIGH = 0x8551eb625aa84ae8L, CONTRAST_LOW = 0xbc84881fea5819a7L;
+    private static final long TONE_HIGH = 0x1eb06fb257db4dc6L, TONE_LOW = 0xb205f1bbd371e299L;
     private static final int EVENT = Long.BYTES + ThermalPayload.SOURCE_BYTES;
     private static final int VERSION = 1;
 
@@ -36,7 +38,7 @@ final class MovieArchive {
         private final ThermalPayload.Encoder encoder = new ThermalPayload.Encoder();
         private final ByteBuffer event = ByteBuffer.allocate(EVENT);
         boolean uniform;
-        private boolean hasThermalOutput;
+        private boolean hasThermalOutput, hasContrast, hasLockedTone;
         long durationUs;
         private long bytes;
         int count;
@@ -72,12 +74,14 @@ final class MovieArchive {
             event.putLong(captureUs);
             ThermalPayload.putSource(event, capture.frame);
             entries.write(event.array());
-            int flags = Float.isFinite(capture.low) ? ThermalPayload.LOCKED : ThermalPayload.AUTO;
+            int flags = capture.scale.locked() ? ThermalPayload.LOCKED : ThermalPayload.AUTO;
             if (capture.frame.thermalOutput) {
                 flags |= 2;
                 hasThermalOutput = true;
             }
-            entries.writeByte(flags);
+            hasContrast |= capture.scale.contrast != ColorScale.NORMAL;
+            hasLockedTone |= capture.lockedTone != 0;
+            entries.writeInt(flags | (capture.scale.contrast << 2) | (capture.lockedTone << 10));
             bytes += size;
             count++;
         }
@@ -100,14 +104,16 @@ final class MovieArchive {
                 for (int i = 0; i < count; i++) {
                     rows.readInt();
                     rows.readFully(event.array());
-                    rows.readByte();
+                    rows.readInt();
                     out.write(event.array());
                 }
             }
             // One byte per sample makes an explicitly locked range unambiguous even
             // when it happens to equal that frame's automatic limits in a v1 record.
-            writeFlags(out, DISPLAY_HIGH, DISPLAY_LOW, 0);
-            if (hasThermalOutput) writeFlags(out, PLANE_HIGH, PLANE_LOW, 1);
+            writeFlags(out, DISPLAY_HIGH, DISPLAY_LOW, 0, 1);
+            if (hasThermalOutput) writeFlags(out, PLANE_HIGH, PLANE_LOW, 1, 1);
+            if (hasContrast) writeFlags(out, CONTRAST_HIGH, CONTRAST_LOW, 2, 255);
+            if (hasLockedTone) writeFlags(out, TONE_HIGH, TONE_LOW, 10, 255);
             out.writeInt(1); // extended box size
             out.writeInt(UUID);
             out.writeLong(48L + (long) ENTRY * count + bytes);
@@ -130,7 +136,7 @@ final class MovieArchive {
                     if (pts <= previous) throw new IOException("Missing or unordered AVC sample");
                     int length = sizes.readInt();
                     sizes.readFully(event.array());
-                    sizes.readByte();
+                    sizes.readInt();
                     out.writeLong(pts);
                     out.writeLong(offset);
                     out.writeInt(length);
@@ -149,7 +155,7 @@ final class MovieArchive {
             return new DataInputStream(new BufferedInputStream(new FileInputStream(index)));
         }
 
-        private void writeFlags(DataOutputStream out, long high, long low, int bit) throws IOException {
+        private void writeFlags(DataOutputStream out, long high, long low, int shift, int mask) throws IOException {
             out.writeInt(1);
             out.writeInt(UUID);
             out.writeLong(36L + count);
@@ -160,7 +166,7 @@ final class MovieArchive {
                 for (int i = 0; i < count; i++) {
                     rows.readInt();
                     rows.readFully(event.array());
-                    out.writeByte((rows.readUnsignedByte() >> bit) & 1);
+                    out.writeByte((rows.readInt() >> shift) & mask);
                 }
             }
         }
@@ -190,6 +196,7 @@ final class MovieArchive {
         private int pageStart = -1, pageEnd;
         private long index, data, end;
         private long events, displayFlags, displayCount, planeFlags, planeCount;
+        private long contrastFlags, contrastCount, toneFlags, toneCount;
         private int eventCount;
         private boolean uniform, legacyBursts;
         private MobileImage movieImage;
@@ -207,6 +214,8 @@ final class MovieArchive {
                 if (events != 0 && eventCount != count) throw new IOException("Mismatched MP4 event count");
                 if (displayFlags != 0 && displayCount != count) throw new IOException("Mismatched MP4 display count");
                 if (planeFlags != 0 && planeCount != count) throw new IOException("Mismatched MP4 plane count");
+                if (contrastFlags != 0 && contrastCount != count) throw new IOException("Mismatched MP4 contrast count");
+                if (toneFlags != 0 && toneCount != count) throw new IOException("Mismatched MP4 tone count");
                 legacyBursts = events == 0 && looksLikeLegacyBurst();
             } catch (IOException | RuntimeException e) {
                 close();
@@ -256,11 +265,19 @@ final class MovieArchive {
                     ByteBuffer id = read(pos + header, 16);
                     long high = id.getLong(), low = id.getLong();
                     boolean plane = high == PLANE_HIGH && low == PLANE_LOW;
-                    if ((plane || (high == DISPLAY_HIGH && low == DISPLAY_LOW))
+                    boolean contrast = high == CONTRAST_HIGH && low == CONTRAST_LOW;
+                    boolean tone = high == TONE_HIGH && low == TONE_LOW;
+                    if ((plane || contrast || tone || (high == DISPLAY_HIGH && low == DISPLAY_LOW))
                             && read(pos + header + 16, 4).getInt() == VERSION) {
                         if (plane) {
                             planeFlags = pos + header + 20;
                             planeCount = size - header - 20;
+                        } else if (contrast) {
+                            contrastFlags = pos + header + 20;
+                            contrastCount = size - header - 20;
+                        } else if (tone) {
+                            toneFlags = pos + header + 20;
+                            toneCount = size - header - 20;
                         } else {
                             displayFlags = pos + header + 20;
                             displayCount = size - header - 20;
@@ -349,8 +366,11 @@ final class MovieArchive {
             int display = displayFlags == 0 ? ThermalPayload.LEGACY_DISPLAY : read(displayFlags + i, 1).get() & 255;
             int plane = planeFlags == 0 ? 0 : read(planeFlags + i, 1).get() & 255;
             if (plane > 1) throw new IOException("Unknown temperature plane");
+            int contrast = contrastFlags == 0 ? ColorScale.NORMAL : read(contrastFlags + i, 1).get() & 255;
+            int tone = toneFlags == 0 ? 0 : read(toneFlags + i, 1).get() & 255;
+            // Event metadata borrows scratch until the decoder consumes it.
             ByteBuffer source = events == 0 ? null : read(events + (long) i * EVENT + 8, ThermalPayload.SOURCE_BYTES);
-            return decoder.decode(packed.array(), size, source, display, plane == 1);
+            return decoder.decode(packed.array(), size, source, display, plane == 1, contrast, tone);
         }
 
         private ByteBuffer entry(int i) throws IOException {
